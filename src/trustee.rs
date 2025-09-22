@@ -1,31 +1,25 @@
-//! Trustee APIs: local trustee shortcut and an explicit remote runtime handle.
-//!
-//! RemoteRuntime owns prebuilt SPSC queues and a trustee thread per property.
-//! The remote API is constrained to non-capturing function items to remain
-//! allocation-free per operation and avoid transferring captured environments.
+//! Trustee APIs: local trustee shortcut and explicit remote runtime with
+//! per-client SPSC rings, trustee-side registration, and RR burst processing
+//! plus minimal backoff to avoid hot spinning under contention.
 
-use crate::{
-    affinity::{PinConfig, pin_current_thread},
-    slots::Spsc,
-};
-use crossbeam_queue::ArrayQueue;
-use std::{marker::PhantomData, sync::Arc, thread, time::Duration};
+use core::marker::PhantomData;
+use smallvec::SmallVec;
+use std::{sync::Arc, thread};
 
 use crate::Trust;
+use crate::affinity::{PinConfig, pin_current_thread};
+use crate::slots::{Spsc, backoff_step};
 
-/// Handle to the local trustee on the current OS thread.
+/// Local trustee is allocation-free and inline.
 pub struct LocalTrustee {
     _private: (),
 }
 
 impl LocalTrustee {
-    /// Construct a local trustee handle.
     #[inline]
     pub fn new() -> Self {
         Self { _private: () }
     }
-
-    /// Entrust a property `T` to this local trustee.
     #[inline]
     pub fn entrust<T>(&self, value: T) -> Trust<T> {
         let _ = &self;
@@ -33,108 +27,144 @@ impl LocalTrustee {
     }
 }
 
-/// Remote operation variants kept allocation-free per op.
-pub(crate) enum RemoteOp<T> {
-    /// Mutate-only operation: fn(&mut T)
+// Remote ops/responses are POD and allocation-free.
+enum RemoteOp<T> {
     Apply(fn(&mut T)),
-    /// Map to u64: fn(&mut T) -> u64
     MapU64(fn(&mut T) -> u64),
+    ApplyBatch(fn(&mut T), u32),
 }
 
-/// Response variants aligned FIFO with requests.
-pub(crate) enum RemoteResp {
+enum RemoteResp {
     None,
     U64(u64),
+    NoneBatch(u32),
 }
 
-/// Remote runtime handle to a remotely entrusted property `T`.
-///
-/// API is constrained to non-capturing function items to remain allocation-free.
+struct ClientPair<T> {
+    req: Arc<Spsc<RemoteOp<T>>>,
+    resp: Arc<Spsc<RemoteResp>>,
+}
+
 pub struct RemoteRuntime<T> {
-    req_q: Arc<Spsc<RemoteOp<T>>>,
-    resp_q: Arc<Spsc<RemoteResp>>,
+    reg_q: Arc<Spsc<ClientPair<T>>>,
+    capacity: usize,
+    burst: usize,
     _worker: thread::JoinHandle<()>,
 }
 
 impl<T: Send + 'static> RemoteRuntime<T> {
-    /// Spawn a trustee OS thread for `value` with fixed-capacity SPSC queues.
-    ///
-    /// Capacity should be chosen to absorb bursts; per-op is allocation-free.
     pub fn spawn(value: T, capacity: usize) -> (Self, RemoteTrust<T>) {
-        Self::spawn_with_pin(value, capacity, None)
+        Self::spawn_with_pin(value, capacity, 64, None)
     }
 
-    /// Spawn with optional pinning configuration.
     pub fn spawn_with_pin(
         value: T,
         capacity: usize,
+        burst: usize,
         pin: Option<PinConfig>,
     ) -> (Self, RemoteTrust<T>) {
-        let req_q = Arc::new(Spsc::new(capacity));
-        let resp_q = Arc::new(Spsc::new(capacity));
-
-        let worker_req = req_q.clone();
-        let worker_resp = resp_q.clone();
+        let reg_q = Arc::new(Spsc::new(1024));
+        let worker_reg = reg_q.clone();
 
         let _worker = thread::spawn(move || {
             if let Some(cfg) = pin {
                 pin_current_thread(&cfg);
             }
             let mut prop = value;
-            let mut idle = 0u32;
+            let mut clients: SmallVec<[ClientPair<T>; 64]> = SmallVec::new();
+            let mut start_idx: usize = 0;
+            let mut idle_spins = 0u32;
+
             loop {
-                if let Some(op) = worker_req.try_pop() {
-                    idle = 0;
-                    match op {
-                        RemoteOp::Apply(f) => {
-                            f(&mut prop);
-                            let _ = worker_resp.try_push(RemoteResp::None);
-                        }
-                        RemoteOp::MapU64(f) => {
-                            let v = f(&mut prop);
-                            let _ = worker_resp.try_push(RemoteResp::U64(v));
-                        }
-                    }
-                } else {
-                    idle = idle.saturating_add(1);
-                    if idle < 10 {
-                        core::hint::spin_loop();
-                    } else if idle < 100 {
-                        thread::yield_now();
+                // Drain registrations in bounded chunks.
+                let mut drained = 0;
+                while drained < 256 {
+                    if let Some(cp) = worker_reg.try_pop() {
+                        clients.push(cp);
+                        drained += 1;
                     } else {
-                        thread::sleep(Duration::from_micros(50));
+                        break;
                     }
+                }
+
+                if clients.is_empty() {
+                    idle_spins = backoff_step(idle_spins);
+                    continue;
+                }
+
+                let n = clients.len();
+                let mut progressed = false;
+
+                for offs in 0..n {
+                    let idx = (start_idx + offs) % n;
+                    let cp = &clients[idx];
+
+                    let mut processed = 0usize;
+                    while processed < burst {
+                        match cp.req.try_pop() {
+                            Some(RemoteOp::Apply(f)) => {
+                                f(&mut prop);
+                                let _ = cp.resp.try_push(RemoteResp::None);
+                                processed += 1;
+                                progressed = true;
+                            }
+                            Some(RemoteOp::MapU64(f)) => {
+                                let v = f(&mut prop);
+                                let _ = cp.resp.try_push(RemoteResp::U64(v));
+                                processed += 1;
+                                progressed = true;
+                            }
+                            Some(RemoteOp::ApplyBatch(f, nrep)) => {
+                                for _ in 0..nrep {
+                                    f(&mut prop);
+                                }
+                                let _ = cp.resp.try_push(RemoteResp::NoneBatch(nrep));
+                                processed += 1;
+                                progressed = true;
+                            }
+                            None => break,
+                        }
+                    }
+
+                    if processed > 0 {
+                        start_idx = (idx + 1) % n;
+                    }
+                }
+
+                if progressed {
+                    idle_spins = 0;
+                } else {
+                    idle_spins = backoff_step(idle_spins);
                 }
             }
         });
 
         let rt = RemoteRuntime {
-            req_q: req_q.clone(),
-            resp_q: resp_q.clone(),
+            reg_q,
+            capacity,
+            burst,
             _worker,
         };
-        let handle = RemoteTrust {
-            req_q,
-            resp_q,
-            _phantom: PhantomData,
-        };
+        let handle = rt.handle();
         (rt, handle)
     }
 
-    /// Access to the client-side handle (clone without extra allocation).
     #[inline]
     pub fn handle(&self) -> RemoteTrust<T> {
+        let req = Arc::new(Spsc::new(self.capacity));
+        let resp = Arc::new(Spsc::new(self.capacity));
+        self.reg_q.push_backoff(ClientPair {
+            req: req.clone(),
+            resp: resp.clone(),
+        });
         RemoteTrust {
-            req_q: self.req_q.clone(),
-            resp_q: self.resp_q.clone(),
+            req_q: req,
+            resp_q: resp,
             _phantom: PhantomData,
         }
     }
 }
 
-/// A client handle to a remotely entrusted property `T`.
-///
-/// API is constrained to non-capturing function items to remain allocation-free.
 pub struct RemoteTrust<T> {
     pub(crate) req_q: Arc<Spsc<RemoteOp<T>>>,
     pub(crate) resp_q: Arc<Spsc<RemoteResp>>,
@@ -142,42 +172,41 @@ pub struct RemoteTrust<T> {
 }
 
 impl<T: Send + 'static> RemoteTrust<T> {
-    /// Apply a mutate-only operation: fn(&mut T).
-    ///
-    /// Blocks until the trustee pushes its matching None response.
     #[inline]
     pub fn apply_mut(&self, f: fn(&mut T)) {
-        // Push request (spin until space is available).
-        while self.req_q.try_push(RemoteOp::Apply(f)).is_err() {
-            std::hint::spin_loop();
-        }
-        // Pop matching response.
+        // Push with backoff if full.
+        self.req_q.push_backoff(RemoteOp::Apply(f));
+        // Pop with backoff if empty.
+        let mut spins = 0u32;
         loop {
-            if let Some(resp) = self.resp_q.try_pop() {
-                match resp {
-                    RemoteResp::None => return,
-                    RemoteResp::U64(_) => continue, // unexpected type; skip
-                }
-            } else {
-                std::hint::spin_loop();
+            if let Some(RemoteResp::None) = self.resp_q.try_pop() {
+                return;
             }
+            spins = backoff_step(spins);
         }
     }
 
-    /// Apply a mapping operation to u64: fn(&mut T) -> u64, returning the value.
     #[inline]
     pub fn apply_map_u64(&self, f: fn(&mut T) -> u64) -> u64 {
-        while self.req_q.try_push(RemoteOp::MapU64(f)).is_err() {
-            std::hint::spin_loop();
-        }
+        self.req_q.push_backoff(RemoteOp::MapU64(f));
+        let mut spins = 0u32;
         loop {
-            if let Some(resp) = self.resp_q.try_pop() {
-                if let RemoteResp::U64(v) = resp {
-                    return v;
-                }
-            } else {
-                std::hint::spin_loop();
+            if let Some(RemoteResp::U64(v)) = self.resp_q.try_pop() {
+                return v;
             }
+            spins = backoff_step(spins);
+        }
+    }
+
+    #[inline]
+    pub fn apply_batch_mut(&self, f: fn(&mut T), n: u32) {
+        self.req_q.push_backoff(RemoteOp::ApplyBatch(f, n));
+        let mut spins = 0u32;
+        loop {
+            if let Some(RemoteResp::NoneBatch(_n)) = self.resp_q.try_pop() {
+                return;
+            }
+            spins = backoff_step(spins);
         }
     }
 }

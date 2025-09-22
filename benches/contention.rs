@@ -6,7 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use trust::{LocalTrustee, RemoteRuntime};
+use trust::{LocalTrustee, PinConfig, RemoteRuntime, pin_current_thread};
 
 fn spawn_atomic_hammer(
     ctr: Arc<AtomicU64>,
@@ -53,6 +53,7 @@ fn incr_i64(c: &mut i64) {
 
 fn bench_contention(c: &mut Criterion) {
     let workers = num_cpus::get().saturating_sub(1).max(1);
+    let batch_sizes: &[u32] = &[1, 4, 16, 64];
 
     let mut group = c.benchmark_group("high_contention");
     group.measurement_time(Duration::from_secs(10));
@@ -96,6 +97,17 @@ fn bench_contention(c: &mut Criterion) {
         }
     }
 
+    // 2b) Mutex<u64> uncontended latency baseline
+    {
+        let ctr = Arc::new(Mutex::new(0u64));
+        group.bench_function("mutex_uncontended", |b| {
+            b.iter(|| {
+                let mut g = ctr.lock().unwrap();
+                *g += 1;
+            });
+        });
+    }
+
     // 3) LocalTrustee (single-threaded fast path; !Sync prevents shared contention)
     {
         let lt = LocalTrustee::new();
@@ -107,33 +119,89 @@ fn bench_contention(c: &mut Criterion) {
         });
     }
 
-    // 4) RemoteRuntime handle with background clients hammering the same trustee
+    // 4) RemoteRuntime with pinning, burst RR fairness, and batched clients.
+    // Measure per-object throughput via apply_batch_mut under background pressure.
     {
-        let (rt, handle) = RemoteRuntime::spawn(0i64, 1024);
-        let run = Arc::new(AtomicBool::new(true));
+        // Pin trustee (and optionally one client) to encourage locality/fairness.
+        #[cfg(target_os = "linux")]
+        let pin_t = PinConfig {
+            core_id: Some(0),
+            numa_node: None,
+            mem_bind: false,
+            mac_affinity_tag: None,
+        };
+        #[cfg(target_os = "macos")]
+        let pin_t = PinConfig {
+            core_id: None,
+            numa_node: None,
+            mem_bind: false,
+            mac_affinity_tag: Some(1),
+        };
 
-        // Background clients each get their own handle and hammer the remote trustee
-        let threads: Vec<_> = (0..workers)
-            .map(|_| {
-                let run = Arc::clone(&run);
-                let h = rt.handle();
-                thread::spawn(move || {
-                    while run.load(Ordering::Relaxed) {
-                        h.apply_mut(incr_i64);
-                    }
+        // Spawn pinned trustee with moderate burst size.
+        let (rt, handle) = RemoteRuntime::spawn_with_pin(0i64, 1024, 64, Some(pin_t));
+
+        for &batch in batch_sizes {
+            let run = Arc::new(AtomicBool::new(true));
+
+            // Background clients, each with private SPSC pair, hammer in batches.
+            let threads: Vec<_> = (0..workers)
+                .map(|i| {
+                    let run = Arc::clone(&run);
+                    let h = rt.handle();
+                    // Optionally pin one client to a different tag/core for locality/fairness.
+                    #[cfg(target_os = "linux")]
+                    let client_pin: Option<PinConfig> = if i == 0 {
+                        Some(PinConfig {
+                            core_id: Some(1),
+                            numa_node: None,
+                            mem_bind: false,
+                            mac_affinity_tag: None,
+                        })
+                    } else {
+                        None
+                    };
+                    #[cfg(target_os = "macos")]
+                    let client_pin: Option<PinConfig> = if i == 0 {
+                        Some(PinConfig {
+                            core_id: None,
+                            numa_node: None,
+                            mem_bind: false,
+                            mac_affinity_tag: Some(2),
+                        })
+                    } else {
+                        None
+                    };
+
+                    thread::spawn(move || {
+                        if let Some(cfg) = client_pin {
+                            // Best-effort pin to keep topology predictable.
+                            pin_current_thread(&cfg);
+                        }
+                        while run.load(Ordering::Relaxed) {
+                            h.apply_batch_mut(incr_i64, batch);
+                            // Yield to let trustee run; avoids perfectly hot spin loops.
+                            std::thread::yield_now();
+                        }
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
-        group.bench_function(BenchmarkId::new("remote_trustee", workers), |b| {
-            b.iter(|| {
-                handle.apply_mut(incr_i64);
-            });
-        });
+            // Foreground client measures batched latency which translates to throughput.
+            group.throughput(Throughput::Elements(batch as u64));
+            group.bench_function(
+                BenchmarkId::new("remote_trustee_batched", format!("w{workers}_b{batch}")),
+                |b| {
+                    b.iter(|| {
+                        handle.apply_batch_mut(incr_i64, batch);
+                    });
+                },
+            );
 
-        run.store(false, Ordering::Relaxed);
-        for t in threads {
-            let _ = t.join();
+            run.store(false, Ordering::Relaxed);
+            for t in threads {
+                let _ = t.join();
+            }
         }
         // drop(rt, handle) at scope end
     }

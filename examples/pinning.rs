@@ -26,7 +26,7 @@ fn main() {
     };
 
     // Spawn a pinned trustee with fixed-capacity queues.
-    let (_rt, h) = RemoteRuntime::spawn_with_pin(0i64, 1024, Some(pin));
+    let (_rt, h) = RemoteRuntime::spawn_with_pin(0i64, 1024, 64, Some(pin));
 
     h.apply_mut(incr);
     let v = h.apply_map_u64(get);
