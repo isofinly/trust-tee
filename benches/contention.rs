@@ -46,7 +46,6 @@ fn spawn_mutex_hammer(
         .collect()
 }
 
-// Remote trustee helpers use fn items (no captures) to keep calls lean.
 fn incr_i64(c: &mut i64) {
     *c += 1;
 }
@@ -58,7 +57,7 @@ fn bench_contention(c: &mut Criterion) {
     let mut group = c.benchmark_group("high_contention");
     group.measurement_time(Duration::from_secs(10));
     group.warm_up_time(Duration::from_millis(800));
-    group.throughput(Throughput::Elements(1)); // one op per iter
+    group.throughput(Throughput::Elements(1));
 
     // 1) AtomicU64 SeqCst under contention from background workers
     {
@@ -120,9 +119,7 @@ fn bench_contention(c: &mut Criterion) {
     }
 
     // 4) RemoteRuntime with pinning, burst RR fairness, and batched clients.
-    // Measure per-object throughput via apply_batch_mut under background pressure.
     {
-        // Pin trustee (and optionally one client) to encourage locality/fairness.
         #[cfg(target_os = "linux")]
         let pin_t = PinConfig {
             core_id: Some(0),
@@ -138,18 +135,15 @@ fn bench_contention(c: &mut Criterion) {
             mac_affinity_tag: Some(1),
         };
 
-        // Spawn pinned trustee with moderate burst size.
         let (rt, handle) = RemoteRuntime::spawn_with_pin(0i64, 1024, 64, Some(pin_t));
 
         for &batch in batch_sizes {
             let run = Arc::new(AtomicBool::new(true));
 
-            // Background clients, each with private SPSC pair, hammer in batches.
             let threads: Vec<_> = (0..workers)
                 .map(|i| {
                     let run = Arc::clone(&run);
                     let h = rt.handle();
-                    // Optionally pin one client to a different tag/core for locality/fairness.
                     #[cfg(target_os = "linux")]
                     let client_pin: Option<PinConfig> = if i == 0 {
                         Some(PinConfig {
@@ -187,7 +181,6 @@ fn bench_contention(c: &mut Criterion) {
                 })
                 .collect();
 
-            // Foreground client measures batched latency which translates to throughput.
             group.throughput(Throughput::Elements(batch as u64));
             group.bench_function(
                 BenchmarkId::new("remote_trustee_batched", format!("w{workers}_b{batch}")),
@@ -203,7 +196,6 @@ fn bench_contention(c: &mut Criterion) {
                 let _ = t.join();
             }
         }
-        // drop(rt, handle) at scope end
     }
 
     group.finish();

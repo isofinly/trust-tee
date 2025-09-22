@@ -4,13 +4,13 @@
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PinConfig {
     /// Logical CPU core to pin to (Linux).
-    pub core_id: Option<usize>, // Linux
+    pub core_id: Option<usize>,
     /// NUMA node id for memory policy (Linux).
-    pub numa_node: Option<u16>, // Linux
+    pub numa_node: Option<u16>,
     /// Whether to bind memory allocations to `numa_node` (Linux).
-    pub mem_bind: bool, // Linux
+    pub mem_bind: bool,
     /// Affinity tag to set via Mach policy (macOS).
-    pub mac_affinity_tag: Option<i32>, // macOS
+    pub mac_affinity_tag: Option<i32>,
 }
 
 /// Apply thread pinning and/or memory policy according to `cfg` for the
