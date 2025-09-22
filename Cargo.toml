@@ -1,0 +1,44 @@
+[package]
+name = "trust"
+version = "0.1.0"
+edition = "2024"
+authors = ["isofinly isofinly.business@icloud.com"]
+license = "MIT"
+
+[dependencies]
+may = { version = "0.3.51" }
+smallvec = "1.15.1"
+crossbeam-queue = "0.3.12"
+num_cpus = "1.16"
+libc = "0.2"
+
+[features]
+default = []
+serde = ["dep:serde", "dep:bincode"]
+
+[dependencies.bincode]
+version = "2.0.1"
+optional = true
+features = ["serde"]
+
+[dependencies.serde]
+version = "1.0"
+features = ["derive"]
+optional = true
+
+[dev-dependencies]
+quickcheck = "1.0.3"
+quickcheck_macros = "1.1.0"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[example]]
+name = "local_trustee"
+path = "examples/local_trustee.rs"
+
+[[example]]
+name = "remote_trustee"
+path = "examples/remote_trustee.rs"
+
+[[bench]]
+name = "contention"
+harness = false
