@@ -1,13 +1,20 @@
 //! Cross-platform thread pinning and optional NUMA memory policy.
 
+/// Configuration for pinning the current thread and optionally binding memory.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PinConfig {
-    pub core_id: Option<usize>,        // Linux
-    pub numa_node: Option<u16>,        // Linux
-    pub mem_bind: bool,                // Linux
+    /// Logical CPU core to pin to (Linux).
+    pub core_id: Option<usize>, // Linux
+    /// NUMA node id for memory policy (Linux).
+    pub numa_node: Option<u16>, // Linux
+    /// Whether to bind memory allocations to `numa_node` (Linux).
+    pub mem_bind: bool, // Linux
+    /// Affinity tag to set via Mach policy (macOS).
     pub mac_affinity_tag: Option<i32>, // macOS
 }
 
+/// Apply thread pinning and/or memory policy according to `cfg` for the
+/// current thread. Platform fields are honored per target OS.
 pub fn pin_current_thread(cfg: &PinConfig) {
     #[cfg(target_os = "linux")]
     {
@@ -46,8 +53,10 @@ pub fn pin_current_thread(cfg: &PinConfig) {
     {
         unsafe {
             if let Some(tag) = cfg.mac_affinity_tag {
+                #[allow(non_camel_case_types)]
                 type thread_t = libc::mach_port_t;
                 #[repr(C)]
+                #[allow(non_camel_case_types)]
                 struct thread_affinity_policy_data_t {
                     affinity_tag: libc::integer_t,
                 }

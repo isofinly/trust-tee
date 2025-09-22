@@ -9,7 +9,6 @@ license = "MIT"
 may = { version = "0.3.51" }
 smallvec = "1.15.1"
 crossbeam-queue = "0.3.12"
-num_cpus = "1.16"
 libc = "0.2"
 
 [features]
@@ -30,14 +29,7 @@ optional = true
 quickcheck = "1.0.3"
 quickcheck_macros = "1.1.0"
 criterion = { version = "0.5", features = ["html_reports"] }
-
-[[example]]
-name = "local_trustee"
-path = "examples/local_trustee.rs"
-
-[[example]]
-name = "remote_trustee"
-path = "examples/remote_trustee.rs"
+num-cpu = "1.16"
 
 [[bench]]
 name = "contention"

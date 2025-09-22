@@ -17,10 +17,12 @@ pub struct LocalTrustee {
 
 impl LocalTrustee {
     #[inline]
+    /// Create a new local trustee.
     pub fn new() -> Self {
         Self { _private: () }
     }
     #[inline]
+    /// Entrust a value to its local trustee and return a `Trust<T>` handle.
     pub fn entrust<T>(&self, value: T) -> Trust<T> {
         let _ = &self;
         Trust::new_local(value)
@@ -45,6 +47,7 @@ struct ClientPair<T> {
     resp: Arc<Spsc<RemoteResp>>,
 }
 
+/// Remote runtime hosting a property `T` on a worker thread and serving clients.
 pub struct RemoteRuntime<T> {
     reg_q: Arc<Spsc<ClientPair<T>>>,
     capacity: usize,
@@ -53,10 +56,12 @@ pub struct RemoteRuntime<T> {
 }
 
 impl<T: Send + 'static> RemoteRuntime<T> {
+    /// Spawn a remote runtime worker thread with default burst and no pinning.
     pub fn spawn(value: T, capacity: usize) -> (Self, RemoteTrust<T>) {
         Self::spawn_with_pin(value, capacity, 64, None)
     }
 
+    /// Spawn a remote runtime worker with explicit `burst` and optional pinning.
     pub fn spawn_with_pin(
         value: T,
         capacity: usize,
@@ -150,6 +155,7 @@ impl<T: Send + 'static> RemoteRuntime<T> {
     }
 
     #[inline]
+    /// Create a client handle by registering SPSC queues with the worker.
     pub fn handle(&self) -> RemoteTrust<T> {
         let req = Arc::new(Spsc::new(self.capacity));
         let resp = Arc::new(Spsc::new(self.capacity));
@@ -165,6 +171,7 @@ impl<T: Send + 'static> RemoteRuntime<T> {
     }
 }
 
+/// Client handle to submit operations to a `RemoteRuntime<T>` and await replies.
 pub struct RemoteTrust<T> {
     pub(crate) req_q: Arc<Spsc<RemoteOp<T>>>,
     pub(crate) resp_q: Arc<Spsc<RemoteResp>>,
@@ -173,6 +180,7 @@ pub struct RemoteTrust<T> {
 
 impl<T: Send + 'static> RemoteTrust<T> {
     #[inline]
+    /// Apply a mutation on the remote property and wait for completion.
     pub fn apply_mut(&self, f: fn(&mut T)) {
         // Push with backoff if full.
         self.req_q.push_backoff(RemoteOp::Apply(f));
@@ -187,6 +195,7 @@ impl<T: Send + 'static> RemoteTrust<T> {
     }
 
     #[inline]
+    /// Apply a function on the remote property and return a `u64` result.
     pub fn apply_map_u64(&self, f: fn(&mut T) -> u64) -> u64 {
         self.req_q.push_backoff(RemoteOp::MapU64(f));
         let mut spins = 0u32;
@@ -199,6 +208,7 @@ impl<T: Send + 'static> RemoteTrust<T> {
     }
 
     #[inline]
+    /// Apply a mutation `n` times on the remote property and wait.
     pub fn apply_batch_mut(&self, f: fn(&mut T), n: u32) {
         self.req_q.push_backoff(RemoteOp::ApplyBatch(f, n));
         let mut spins = 0u32;

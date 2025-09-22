@@ -752,7 +752,6 @@ dependencies = [
  "crossbeam-queue",
  "libc",
  "may",
- "num_cpus",
  "quickcheck",
  "quickcheck_macros",
  "serde",
