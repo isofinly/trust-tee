@@ -1,5 +1,5 @@
 [package]
-name = "trust"
+name = "trust-tee"
 version = "0.1.0"
 edition = "2024"
 authors = ["isofinly isofinly.business@icloud.com"]

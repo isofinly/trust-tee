@@ -1,4 +1,4 @@
-use trust::{Latch, LocalTrustee};
+use trust_tee::{Latch, LocalTrustee};
 
 fn main() {
     let lt = LocalTrustee::new();

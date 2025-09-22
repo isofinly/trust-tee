@@ -6,7 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use trust::{LocalTrustee, PinConfig, RemoteRuntime, pin_current_thread};
+use trust_tee::{LocalTrustee, PinConfig, RemoteRuntime, pin_current_thread};
 
 fn spawn_atomic_hammer(
     ctr: Arc<AtomicU64>,

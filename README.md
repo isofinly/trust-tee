@@ -25,7 +25,7 @@ Trust<T> is based on **delegation**, a message-passing technique that avoids the
 ### Basic Operations
 
 ```rust
-use trust::{LocalTrustee, Trust};
+use trust_tee::{LocalTrustee, Trust};
 
 fn main() {
     let lt = LocalTrustee::new();
@@ -60,7 +60,7 @@ fn main() {
 ```rust
 use std::thread;
 
-use trust::RemoteRuntime;
+use trust_tee::RemoteRuntime;
 
 // Non-capturing functions only (fn items) to remain allocation-free.
 fn incr(c: &mut i64) {

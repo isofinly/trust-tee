@@ -1,5 +1,4 @@
-// examples/remote_pinned.rs
-use trust::{PinConfig, RemoteRuntime};
+use trust_tee::{PinConfig, RemoteRuntime};
 
 fn incr(c: &mut i64) {
     *c += 1;

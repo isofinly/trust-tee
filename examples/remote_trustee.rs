@@ -1,6 +1,6 @@
 use std::thread;
 
-use trust::RemoteRuntime;
+use trust_tee::RemoteRuntime;
 
 // Non-capturing functions only (fn items) to remain allocation-free.
 fn incr(c: &mut i64) {
