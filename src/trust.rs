@@ -1,6 +1,4 @@
-//! Trust<T> MVP with: local trustee shortcut, per-client SPSC rings for remote
-//! delegation, trustee-side registration + RR burst processing, optional pinning,
-//! and a trustee-local Latch<T>. Zero per-op allocation and no TLS.
+use std::cell::UnsafeCell;
 
 /// A trust over a property `T` executed by its local trustee.
 pub struct Trust<T> {

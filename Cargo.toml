@@ -29,7 +29,7 @@ optional = true
 quickcheck = "1.0.3"
 quickcheck_macros = "1.1.0"
 criterion = { version = "0.5", features = ["html_reports"] }
-num-cpu = "1.16"
+num_cpus = "1.16"
 
 [[bench]]
 name = "contention"
