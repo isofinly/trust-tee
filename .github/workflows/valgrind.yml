@@ -16,6 +16,7 @@ jobs:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: -C debuginfo=2
       CARGO_INCREMENTAL: 0
+      BENCH_BIN_NAMES: "perf_local perf_pinned_remote perf_latch"
 
     steps:
       - name: Checkout
@@ -34,7 +35,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p test-results
-          if cargo test --workspace --all-features -- --quiet --nocapture | tee test-results/tests-output.txt; then
+          if cargo test --workspace --all-features --profile profiling -- --quiet --nocapture | tee test-results/tests-output.txt; then
             echo ok > test-results/status
           else
             echo failed > test-results/status
@@ -51,11 +52,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p valgrind-memcheck
-          shopt -s nullglob
-          for path in target/profiling/deps/perf_*; do
-            # skip non-executables and *.d files
-            [[ -x "$path" ]] || continue
-            [[ "$path" == *.d ]] && continue
+          for name in $BENCH_BIN_NAMES; do
+            path=$(compgen -G "target/profiling/deps/${name}-*" | head -n1 || true)
+            if [[ -z "$path" ]]; then
+              echo "Could not find built binary for $name under target/profiling/deps" >&2
+              exit 1
+            fi
+            if [[ ! -x "$path" || "$path" == *.d ]]; then
+              echo "Resolved path is not executable for $name: $path" >&2
+              exit 1
+            fi
             bin=$(basename "$path")
             log="valgrind-memcheck/${bin}.memcheck.log"
             echo "==> memcheck: $bin"
@@ -77,16 +83,21 @@ jobs:
             fi
           done
 
-      - name: Run cachegrind and annotate (perf_*)
+      - name: Run cachegrind and annotate (perf_local, perf_pinned_remote, perf_latch)
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p cachegrind-annotated
-          shopt -s nullglob
-          for path in target/profiling/deps/perf_*; do
-            # skip non-executables and *.d files
-            [[ -x "$path" ]] || continue
-            [[ "$path" == *.d ]] && continue
+          for name in $BENCH_BIN_NAMES; do
+            path=$(compgen -G "target/profiling/deps/${name}-*" | head -n1 || true)
+            if [[ -z "$path" ]]; then
+              echo "Could not find built binary for $name under target/profiling/deps" >&2
+              exit 1
+            fi
+            if [[ ! -x "$path" || "$path" == *.d ]]; then
+              echo "Resolved path is not executable for $name: $path" >&2
+              exit 1
+            fi
             bin=$(basename "$path")
             raw_out="cachegrind-${bin}.out"
             ann_out="cachegrind-annotated/${bin}.annotated.txt"
