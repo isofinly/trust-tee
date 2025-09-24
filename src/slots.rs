@@ -6,6 +6,8 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use branches::{likely, unlikely};
+
 const CACHELINE: usize = 64;
 
 #[repr(align(64))]
@@ -66,7 +68,7 @@ impl<T> Spsc<T> {
     /// Try to push a value; Err(value) if full.
     #[inline]
     pub fn try_push(&self, value: T) -> Result<(), T> {
-        let head = self.head.val.load(Ordering::Acquire);
+        let head = self.head.val.load(Ordering::Relaxed);
         let tail = self.tail.val.load(Ordering::Relaxed);
         if tail.wrapping_sub(head) >= self.cap {
             return Err(value);
@@ -85,7 +87,7 @@ impl<T> Spsc<T> {
     pub fn try_pop(&self) -> Option<T> {
         let tail = self.tail.val.load(Ordering::Acquire);
         let head = self.head.val.load(Ordering::Relaxed);
-        if head == tail {
+        if unlikely(head == tail) {
             return None;
         }
         let idx = head & self.mask;
@@ -164,16 +166,23 @@ impl WaitBudget {
         self.yields = 0;
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn step(&mut self) {
         if self.spins < self.spin_cap {
             core::hint::spin_loop();
             self.spins += 1;
-        } else if self.yields < self.yield_cap {
+            return;
+        }
+        self.step_slow();
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn step_slow(&mut self) {
+        if self.yields < self.yield_cap {
             std::thread::yield_now();
             self.yields += 1;
         } else {
-            // Stay hot without parking to avoid scheduler-induced latency.
             core::hint::spin_loop();
         }
     }

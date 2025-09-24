@@ -221,7 +221,7 @@ impl<T: Send + 'static> RemoteTrust<T> {
     }
 
     #[inline]
-    /// Apply a mutation `n` times on the remote property and wait.
+    /// Apply a mutation `n` times on the remote property and wait for completion.
     pub fn apply_batch_mut(&self, f: fn(&mut T), n: u32) {
         self.req_q.push_backoff(RemoteOp::ApplyBatch(f, n));
         let mut budget = WaitBudget::hot();

@@ -55,8 +55,8 @@ fn bench_contention(c: &mut Criterion) {
     let batch_sizes: &[u32] = &[1, 4, 16, 64];
 
     let mut group = c.benchmark_group("high_contention");
-    group.measurement_time(Duration::from_secs(10));
-    group.warm_up_time(Duration::from_millis(800));
+    group.measurement_time(Duration::from_secs(15));
+    group.warm_up_time(Duration::from_millis(1200));
     group.throughput(Throughput::Elements(1));
 
     // 1) AtomicU64 SeqCst under contention from background workers
