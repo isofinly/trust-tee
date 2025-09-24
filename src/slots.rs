@@ -98,13 +98,13 @@ impl<T> Spsc<T> {
     /// Push with bounded backoff if full.
     #[inline]
     pub fn push_backoff(&self, mut value: T) {
-        let mut spins = 0u32;
+        let mut budget = WaitBudget::hot();
         loop {
             match self.try_push(value) {
                 Ok(()) => return,
                 Err(v) => {
                     value = v;
-                    spins = backoff_step(spins);
+                    budget.step();
                 }
             }
         }
@@ -113,12 +113,12 @@ impl<T> Spsc<T> {
     /// Pop with bounded backoff if empty.
     #[inline]
     pub fn pop_backoff(&self) -> T {
-        let mut spins = 0u32;
+        let mut budget = WaitBudget::hot();
         loop {
             if let Some(v) = self.try_pop() {
                 return v;
             }
-            spins = backoff_step(spins);
+            budget.step();
         }
     }
 }
@@ -138,18 +138,43 @@ impl<T> Drop for Spsc<T> {
     }
 }
 
-/// Simple backoff: spin, yield, then park for a very short timeout.
-#[inline]
-pub fn backoff_step(spins: u32) -> u32 {
-    if spins < 40 {
-        core::hint::spin_loop();
-        spins + 1
-    } else if spins < 80 {
-        std::thread::yield_now();
-        spins + 1
-    } else {
-        // Park timeout avoids full busy-wait without requiring explicit unpark.
-        std::thread::park_timeout(std::time::Duration::from_micros(50));
-        0
+/// Lightweight wait budget: bounded spin then yield; never parks by default.
+#[derive(Copy, Clone)]
+pub struct WaitBudget {
+    spins: u32,
+    yields: u32,
+    spin_cap: u32,
+    yield_cap: u32,
+}
+
+impl WaitBudget {
+    #[inline]
+    pub fn hot() -> Self {
+        Self {
+            spins: 0,
+            yields: 0,
+            spin_cap: 128,
+            yield_cap: 8,
+        }
+    }
+
+    #[inline]
+    pub fn reset(&mut self) {
+        self.spins = 0;
+        self.yields = 0;
+    }
+
+    #[inline]
+    pub fn step(&mut self) {
+        if self.spins < self.spin_cap {
+            core::hint::spin_loop();
+            self.spins += 1;
+        } else if self.yields < self.yield_cap {
+            std::thread::yield_now();
+            self.yields += 1;
+        } else {
+            // Stay hot without parking to avoid scheduler-induced latency.
+            core::hint::spin_loop();
+        }
     }
 }

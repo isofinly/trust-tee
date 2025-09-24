@@ -8,7 +8,7 @@ use std::{sync::Arc, thread};
 
 use crate::Trust;
 use crate::affinity::{PinConfig, pin_current_thread};
-use crate::slots::{Spsc, backoff_step};
+use crate::slots::{Spsc, WaitBudget};
 
 /// Local trustee is allocation-free and inline.
 pub struct LocalTrustee {
@@ -78,7 +78,7 @@ impl<T: Send + 'static> RemoteRuntime<T> {
             let mut prop = value;
             let mut clients: SmallVec<[ClientPair<T>; 64]> = SmallVec::new();
             let mut start_idx: usize = 0;
-            let mut idle_spins = 0u32;
+            let mut idle_rounds: u32 = 0;
 
             loop {
                 // Drain registrations in bounded chunks.
@@ -93,7 +93,14 @@ impl<T: Send + 'static> RemoteRuntime<T> {
                 }
 
                 if clients.is_empty() {
-                    idle_spins = backoff_step(idle_spins);
+                    // Light idle: short spin, then yield; never park.
+                    if idle_rounds < 8 {
+                        core::hint::spin_loop();
+                        idle_rounds += 1;
+                    } else {
+                        std::thread::yield_now();
+                        idle_rounds = 0;
+                    }
                     continue;
                 }
 
@@ -137,9 +144,15 @@ impl<T: Send + 'static> RemoteRuntime<T> {
                 }
 
                 if progressed {
-                    idle_spins = 0;
+                    idle_rounds = 0;
                 } else {
-                    idle_spins = backoff_step(idle_spins);
+                    if idle_rounds < 8 {
+                        core::hint::spin_loop();
+                        idle_rounds += 1;
+                    } else {
+                        std::thread::yield_now();
+                        idle_rounds = 0;
+                    }
                 }
             }
         });
@@ -185,12 +198,12 @@ impl<T: Send + 'static> RemoteTrust<T> {
         // Push with backoff if full.
         self.req_q.push_backoff(RemoteOp::Apply(f));
         // Pop with backoff if empty.
-        let mut spins = 0u32;
+        let mut budget = WaitBudget::hot();
         loop {
             if let Some(RemoteResp::None) = self.resp_q.try_pop() {
                 return;
             }
-            spins = backoff_step(spins);
+            budget.step();
         }
     }
 
@@ -198,12 +211,12 @@ impl<T: Send + 'static> RemoteTrust<T> {
     /// Apply a function on the remote property and return a `u64` result.
     pub fn apply_map_u64(&self, f: fn(&mut T) -> u64) -> u64 {
         self.req_q.push_backoff(RemoteOp::MapU64(f));
-        let mut spins = 0u32;
+        let mut budget = WaitBudget::hot();
         loop {
             if let Some(RemoteResp::U64(v)) = self.resp_q.try_pop() {
                 return v;
             }
-            spins = backoff_step(spins);
+            budget.step();
         }
     }
 
@@ -211,12 +224,12 @@ impl<T: Send + 'static> RemoteTrust<T> {
     /// Apply a mutation `n` times on the remote property and wait.
     pub fn apply_batch_mut(&self, f: fn(&mut T), n: u32) {
         self.req_q.push_backoff(RemoteOp::ApplyBatch(f, n));
-        let mut spins = 0u32;
+        let mut budget = WaitBudget::hot();
         loop {
             if let Some(RemoteResp::NoneBatch(_n)) = self.resp_q.try_pop() {
                 return;
             }
-            spins = backoff_step(spins);
+            budget.step();
         }
     }
 }
