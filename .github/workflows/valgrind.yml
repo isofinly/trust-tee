@@ -8,7 +8,7 @@ on:
 
 jobs:
   valgrind:
-    name: Run tests under Valgrind
+    name: Run benchmarks under Valgrind
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
@@ -29,12 +29,12 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends valgrind
 
-      - name: Run tests normally (profiling) and capture output
+      - name: Run tests normally and capture output
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p test-results
-          if cargo test --workspace --all-features --profile profiling -- --quiet --nocapture | tee test-results/tests-output.txt; then
+          if cargo test --workspace --all-features -- --quiet --nocapture | tee test-results/tests-output.txt; then
             echo ok > test-results/status
           else
             echo failed > test-results/status
@@ -45,10 +45,6 @@ jobs:
         with:
           name: test-results
           path: test-results/
-
-      - name: Build benches as bins (profiling)
-        run: |
-          cargo bench --no-run --profile profiling --all-features
 
       - name: Run memcheck (perf_local, perf_pinned_remote, perf_latch)
         shell: bash
