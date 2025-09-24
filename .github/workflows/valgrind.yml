@@ -14,9 +14,10 @@ jobs:
 
     env:
       CARGO_TERM_COLOR: always
-      RUSTFLAGS: -C debuginfo=2
+      RUSTFLAGS: -C debuginfo=2 -C force-frame-pointers=yes
       CARGO_INCREMENTAL: 0
       BENCH_BIN_NAMES: "perf_local perf_pinned_remote perf_latch"
+      ITER: "1"
 
     steps:
       - name: Checkout
@@ -47,25 +48,30 @@ jobs:
           name: test-results
           path: test-results/
 
+      - name: Build binaries (profiling)
+        shell: bash
+        run: |
+          cargo build --workspace --all-features --profile profiling --bins
+
       - name: Run memcheck (perf_local, perf_pinned_remote, perf_latch)
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p valgrind-memcheck
           for name in $BENCH_BIN_NAMES; do
-            path=$(compgen -G "target/profiling/deps/${name}-*" | head -n1 || true)
+            path="target/profiling/${name}"
             if [[ -z "$path" ]]; then
               echo "Could not find built binary for $name under target/profiling/deps" >&2
               exit 1
             fi
-            if [[ ! -x "$path" || "$path" == *.d ]]; then
+            if [[ ! -x "$path" ]]; then
               echo "Resolved path is not executable for $name: $path" >&2
               exit 1
             fi
             bin=$(basename "$path")
             log="valgrind-memcheck/${bin}.memcheck.log"
             echo "==> memcheck: $bin"
-            valgrind \
+            ITER=${ITER} valgrind \
               --tool=memcheck \
               --leak-check=full \
               --show-leak-kinds=all \
@@ -89,12 +95,12 @@ jobs:
           set -euo pipefail
           mkdir -p cachegrind-annotated
           for name in $BENCH_BIN_NAMES; do
-            path=$(compgen -G "target/profiling/deps/${name}-*" | head -n1 || true)
+            path="target/profiling/${name}"
             if [[ -z "$path" ]]; then
               echo "Could not find built binary for $name under target/profiling/deps" >&2
               exit 1
             fi
-            if [[ ! -x "$path" || "$path" == *.d ]]; then
+            if [[ ! -x "$path" ]]; then
               echo "Resolved path is not executable for $name: $path" >&2
               exit 1
             fi
@@ -102,14 +108,14 @@ jobs:
             raw_out="cachegrind-${bin}.out"
             ann_out="cachegrind-annotated/${bin}.annotated.txt"
             echo "==> cachegrind+cg_annotate: $bin"
-            valgrind \
+            ITER=${ITER} valgrind \
               --tool=cachegrind \
               --trace-children=yes \
               --child-silent-after-fork=yes \
               --cachegrind-out-file="$raw_out" \
               "$path" >/dev/null 2>&1 || true
             if command -v cg_annotate >/dev/null 2>&1; then
-              cg_annotate "$raw_out" > "$ann_out" || true
+              cg_annotate --demangle=yes --show-percs=yes --threshold=0.10 --auto=yes --show-top=100 "$raw_out" > "$ann_out" || true
             else
               echo "cg_annotate missing" > "$ann_out"
             fi
