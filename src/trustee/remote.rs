@@ -9,6 +9,8 @@ enum RemoteOp<T> {
     Apply(fn(&mut T)),
     MapU64(fn(&mut T) -> u64),
     ApplyBatch(fn(&mut T), u32),
+    // Signal the worker to terminate cleanly.
+    Terminate,
 }
 
 enum RemoteResp {
@@ -27,7 +29,7 @@ pub struct RemoteRuntime<T> {
     reg_q: Arc<Spsc<ClientPair<T>>>,
     capacity: usize,
     burst: usize,
-    _worker: thread::JoinHandle<()>,
+    _worker: Option<thread::JoinHandle<()>>,
 }
 
 impl<T: Send + 'static> RemoteRuntime<T> {
@@ -109,6 +111,10 @@ impl<T: Send + 'static> RemoteRuntime<T> {
                                 processed += 1;
                                 progressed = true;
                             }
+                            Some(RemoteOp::Terminate) => {
+                                // Break outer loop and exit thread.
+                                return;
+                            }
                             None => break,
                         }
                     }
@@ -136,7 +142,7 @@ impl<T: Send + 'static> RemoteRuntime<T> {
             reg_q,
             capacity,
             burst,
-            _worker,
+            _worker: Some(_worker),
         };
         let handle = rt.handle();
         (rt, handle)
@@ -155,6 +161,25 @@ impl<T: Send + 'static> RemoteRuntime<T> {
             req_q: req,
             resp_q: resp,
             _phantom: PhantomData,
+        }
+    }
+}
+
+impl<T> Drop for RemoteRuntime<T> {
+    fn drop(&mut self) {
+        // Ask all registered clients to terminate the worker if any exist.
+        // We cannot access clients directly here; instead we register a one-off
+        // control client and send a Terminate op.
+        let req = Arc::new(Spsc::new(self.capacity));
+        let resp = Arc::new(Spsc::new(self.capacity));
+        self.reg_q.push_backoff(ClientPair {
+            req: req.clone(),
+            resp: resp.clone(),
+        });
+        req.push_backoff(RemoteOp::Terminate);
+        // Join the worker to ensure all allocations are torn down before exit.
+        if let Some(handle) = self._worker.take() {
+            let _ = handle.join();
         }
     }
 }
