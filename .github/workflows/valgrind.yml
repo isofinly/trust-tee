@@ -1,0 +1,115 @@
+name: Valgrind (memcheck + cachegrind)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  valgrind:
+    name: Run tests under Valgrind
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: -C debuginfo=2
+      CARGO_INCREMENTAL: 0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install valgrind
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends valgrind
+
+      - name: Run tests normally (profiling) and capture output
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          if cargo test --workspace --all-features --profile profiling -- --quiet --nocapture | tee test-results/tests-output.txt; then
+            echo ok > test-results/status
+          else
+            echo failed > test-results/status
+          fi
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results/
+
+      - name: Build benches as bins (profiling)
+        run: |
+          cargo bench --no-run --profile profiling --all-features
+
+      - name: Run memcheck (perf_local, perf_pinned_remote, perf_latch)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p valgrind-memcheck
+          shopt -s nullglob
+          for path in target/profiling/deps/perf_*; do
+            bin=$(basename "$path")
+            log="valgrind-memcheck/${bin}.memcheck.log"
+            echo "==> memcheck: $bin"
+            valgrind \
+              --tool=memcheck \
+              --leak-check=full \
+              --show-leak-kinds=all \
+              --track-origins=yes \
+              --errors-for-leak-kinds=definite,possible \
+              --exit-on-first-error=no \
+              --error-exitcode=99 \
+              --trace-children=yes \
+              --child-silent-after-fork=yes \
+              --log-file="$log" \
+              "$path" >/dev/null 2>&1 || rc=$?
+            if [ "${rc:-0}" -ne 0 ]; then
+              echo "memcheck failed for $bin with code ${rc:-0}; see $log" >&2
+              exit "$rc"
+            fi
+          done
+
+      - name: Run cachegrind and annotate (perf_*)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p cachegrind-annotated
+          shopt -s nullglob
+          for path in target/profiling/deps/perf_*; do
+            bin=$(basename "$path")
+            raw_out="cachegrind-${bin}.out"
+            ann_out="cachegrind-annotated/${bin}.annotated.txt"
+            echo "==> cachegrind+cg_annotate: $bin"
+            valgrind \
+              --tool=cachegrind \
+              --trace-children=yes \
+              --child-silent-after-fork=yes \
+              --cachegrind-out-file="$raw_out" \
+              "$path" >/dev/null 2>&1 || true
+            if command -v cg_annotate >/dev/null 2>&1; then
+              cg_annotate "$raw_out" > "$ann_out" || true
+            else
+              echo "cg_annotate missing" > "$ann_out"
+            fi
+          done
+
+      - name: Upload memcheck logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: valgrind-memcheck-logs
+          path: valgrind-memcheck/
+
+      - name: Upload cachegrind annotated outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: cachegrind-annotated
+          path: cachegrind-annotated/
