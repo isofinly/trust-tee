@@ -57,6 +57,9 @@ jobs:
           mkdir -p valgrind-memcheck
           shopt -s nullglob
           for path in target/profiling/deps/perf_*; do
+            # skip non-executables and *.d files
+            [[ -x "$path" ]] || continue
+            [[ "$path" == *.d ]] && continue
             bin=$(basename "$path")
             log="valgrind-memcheck/${bin}.memcheck.log"
             echo "==> memcheck: $bin"
@@ -85,6 +88,9 @@ jobs:
           mkdir -p cachegrind-annotated
           shopt -s nullglob
           for path in target/profiling/deps/perf_*; do
+            # skip non-executables and *.d files
+            [[ -x "$path" ]] || continue
+            [[ "$path" == *.d ]] && continue
             bin=$(basename "$path")
             raw_out="cachegrind-${bin}.out"
             ann_out="cachegrind-annotated/${bin}.annotated.txt"
