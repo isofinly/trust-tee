@@ -51,7 +51,8 @@ fn incr_i64(c: &mut i64) {
 }
 
 fn bench_contention(c: &mut Criterion) {
-    let workers = num_cpus::get().saturating_sub(1).max(1);
+    // let workers = num_cpus::get().saturating_sub(1).max(1);
+    let workers = 3;
     let batch_sizes: &[u32] = &[1, 4, 16, 64];
 
     let mut group = c.benchmark_group("high_contention");
