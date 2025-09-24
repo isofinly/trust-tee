@@ -12,7 +12,9 @@ mod slots;
 mod trust;
 mod trustee;
 
+pub use crate::trustee::local::LocalTrustee;
+pub use crate::trustee::remote::RemoteRuntime;
+pub use crate::trustee::remote::RemoteTrust;
 pub use affinity::{PinConfig, pin_current_thread};
 pub use latch::Latch;
 pub use trust::*;
-pub use trustee::{LocalTrustee, RemoteRuntime, RemoteTrust};

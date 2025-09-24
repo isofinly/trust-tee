@@ -1,34 +1,9 @@
-//! Trustee APIs: local trustee shortcut and explicit remote runtime with
-//! per-client SPSC rings, trustee-side registration, and RR burst processing
-//! plus minimal backoff to avoid hot spinning under contention.
-
 use core::marker::PhantomData;
 use smallvec::SmallVec;
 use std::{sync::Arc, thread};
 
-use crate::Trust;
 use crate::affinity::{PinConfig, pin_current_thread};
 use crate::slots::{Spsc, WaitBudget};
-
-/// Local trustee is allocation-free and inline.
-pub struct LocalTrustee {
-    _private: (),
-}
-
-impl LocalTrustee {
-    #[inline]
-    /// Create a new local trustee.
-    pub fn new() -> Self {
-        Self { _private: () }
-    }
-    #[inline]
-    /// Entrust a value to its local trustee and return a `Trust<T>` handle.
-    pub fn entrust<T>(&self, value: T) -> Trust<T> {
-        let _ = &self;
-        Trust::new_local(value)
-    }
-}
-
 // Remote ops/responses are POD and allocation-free.
 enum RemoteOp<T> {
     Apply(fn(&mut T)),
@@ -186,9 +161,9 @@ impl<T: Send + 'static> RemoteRuntime<T> {
 
 /// Client handle to submit operations to a `RemoteRuntime<T>` and await replies.
 pub struct RemoteTrust<T> {
-    pub(crate) req_q: Arc<Spsc<RemoteOp<T>>>,
-    pub(crate) resp_q: Arc<Spsc<RemoteResp>>,
-    pub(crate) _phantom: PhantomData<T>,
+    req_q: Arc<Spsc<RemoteOp<T>>>,
+    resp_q: Arc<Spsc<RemoteResp>>,
+    _phantom: PhantomData<T>,
 }
 
 impl<T: Send + 'static> RemoteTrust<T> {

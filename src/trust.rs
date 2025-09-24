@@ -44,3 +44,42 @@ impl<T> Trust<T> {
         unsafe { f(&*self.inner.get()) }
     }
 }
+
+impl<U> Trust<crate::latch::Latch<U>> {
+    /// Execute `f` inside the latch’s critical section on the local trustee.
+    ///
+    /// Zero-alloc; panics if re-entered while already holding the latch.
+    #[inline]
+    pub fn lock_apply<R>(&self, f: impl FnOnce(&mut U) -> R) -> R {
+        let _guard = crate::fiber::DelegatedScopeGuard::enter();
+        // Safety: local trustee shortcut; serialized by contract.
+        let latch = unsafe { &mut *self.inner.get() };
+        let mut g = latch.lock();
+        f(&mut *g)
+    }
+
+    /// Lock + continuation variant; runs `then` immediately after `f`.
+    #[inline]
+    pub fn lock_apply_then<R>(&self, f: impl FnOnce(&mut U) -> R, then: impl FnOnce(R)) {
+        let r = self.lock_apply(f);
+        crate::fiber::enqueue_then(then, r);
+    }
+
+    /// Lock + an explicit out-of-band argument; no serialization on local path.
+    #[inline]
+    pub fn lock_apply_with<V, R>(&self, f: impl FnOnce(&mut U, V) -> R, w: V) -> R {
+        let _guard = crate::fiber::DelegatedScopeGuard::enter();
+        let latch = unsafe { &mut *self.inner.get() };
+        let mut g = latch.lock();
+        f(&mut *g, w)
+    }
+
+    /// Inspect immutably while holding the latch; handy for diagnostics/tests.
+    #[inline]
+    pub fn lock_with<R>(&self, f: impl FnOnce(&U) -> R) -> R {
+        let _guard = crate::fiber::DelegatedScopeGuard::enter();
+        let latch = unsafe { &mut *self.inner.get() };
+        let g = latch.lock();
+        f(&*g)
+    }
+}

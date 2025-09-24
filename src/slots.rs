@@ -6,11 +6,12 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use branches::{likely, unlikely};
+use branches::unlikely;
 
 const CACHELINE: usize = 64;
 
 #[repr(align(64))]
+#[allow(dead_code)] // Cache padding is not used
 struct Pad([u8; CACHELINE]);
 
 #[repr(C)]
