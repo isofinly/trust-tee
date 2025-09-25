@@ -6,7 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use trust_tee::{LocalTrustee, PinConfig, RemoteRuntime, pin_current_thread};
+use trust_tee::prelude::*;
 
 fn spawn_atomic_hammer(
     ctr: Arc<AtomicU64>,
@@ -110,8 +110,7 @@ fn bench_contention(c: &mut Criterion) {
 
     // 3) LocalTrustee (single-threaded fast path; !Sync prevents shared contention)
     {
-        let lt = LocalTrustee::new();
-        let t = lt.entrust(0i64);
+        let t = Trust::entrust(0i64);
         group.bench_function("local_trustee", |b| {
             b.iter(|| {
                 t.apply(|c| *c += 1);
@@ -136,7 +135,7 @@ fn bench_contention(c: &mut Criterion) {
             mac_affinity_tag: Some(1),
         };
 
-        let (rt, handle) = RemoteRuntime::spawn_with_pin(0i64, 1024, 64, Some(pin_t));
+        let (rt, handle) = Runtime::spawn_with_pin(0i64, 1024, 64, Some(pin_t.clone()));
 
         for &batch in batch_sizes {
             let run = Arc::new(AtomicBool::new(true));
@@ -144,7 +143,7 @@ fn bench_contention(c: &mut Criterion) {
             let threads: Vec<_> = (0..workers)
                 .map(|i| {
                     let run = Arc::clone(&run);
-                    let h = rt.handle();
+                    let h = rt.entrust();
                     #[cfg(target_os = "linux")]
                     let client_pin: Option<PinConfig> = if i == 0 {
                         Some(PinConfig {

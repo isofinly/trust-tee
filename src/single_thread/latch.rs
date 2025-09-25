@@ -30,7 +30,7 @@ impl<T> Latch<T> {
         self.locked.set(true);
         Some(LatchGuard {
             latch: self,
-            _marker: std::marker::PhantomData,
+            _marker: core::marker::PhantomData,
         })
     }
 
@@ -62,7 +62,7 @@ impl<T> Latch<T> {
 /// Guard returned by `Latch` methods; unlocks on drop.
 pub struct LatchGuard<'a, T> {
     latch: &'a Latch<T>,
-    _marker: std::marker::PhantomData<*const ()>,
+    _marker: core::marker::PhantomData<*const ()>,
 }
 
 impl<'a, T> Deref for LatchGuard<'a, T> {

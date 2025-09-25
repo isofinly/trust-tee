@@ -8,6 +8,7 @@ pub struct WaitBudget {
 }
 
 impl WaitBudget {
+    /// Create a hot wait budget optimized for high contention.
     #[inline]
     pub fn hot() -> Self {
         Self {
@@ -18,12 +19,14 @@ impl WaitBudget {
         }
     }
 
+    /// Reset the wait budget counters.
     #[inline]
     pub fn reset(&mut self) {
         self.spins = 0;
         self.yields = 0;
     }
 
+    /// Perform one step of the wait strategy (spin, yield, or continue spinning).
     #[inline]
     pub fn step(&mut self) {
         if self.spins < self.spin_cap {
@@ -35,6 +38,16 @@ impl WaitBudget {
         } else {
             // Stay hot without parking to avoid scheduler-induced latency.
             core::hint::spin_loop();
+        }
+    }
+
+    /// Create a default wait budget with moderate settings.
+    pub fn default() -> Self {
+        Self {
+            spins: 0,
+            yields: 0,
+            spin_cap: 64,
+            yield_cap: 4,
         }
     }
 }

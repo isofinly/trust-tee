@@ -5,17 +5,25 @@
 //! delegation, trustee-side registration + RR burst processing, optional pinning,
 //! and a trustee-local Latch<T>. Zero per-op allocation and no TLS.
 
-mod affinity;
-mod fiber;
-mod latch;
-mod ring;
-mod trust;
-mod trustee;
+//! Trust-based concurrency primitives for local and remote execution.
 
-pub use crate::trustee::local::LocalTrustee;
-pub use crate::trustee::remote::RemoteRuntime;
-pub use crate::trustee::remote::RemoteTrust;
-pub use affinity::{PinConfig, pin_current_thread};
-pub use latch::Latch;
-// No longer exposing SPSC in the public API; internals now use ArrayQueue.
-pub use trust::*;
+/// Local and remote trust implementations.
+pub mod trust;
+
+/// Single-threaded primitives that don't use atomics.
+pub mod single_thread;
+
+/// Shared utilities for waiting, affinity, and fiber management.
+pub mod util;
+
+/// Remote runtime for cross-thread trust execution.
+pub mod runtime;
+
+/// Common re-exports for convenient usage.
+pub mod prelude {
+    pub use crate::runtime::Runtime;
+    pub use crate::single_thread::Latch;
+    pub use crate::trust::Remote;
+    pub use crate::trust::{Trust, TrustLike};
+    pub use crate::util::{PinConfig, WaitBudget, pin_current_thread};
+}

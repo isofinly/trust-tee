@@ -1,6 +1,6 @@
 use std::env;
 
-use trust_tee::{Latch, LocalTrustee};
+use trust_tee::prelude::*;
 
 #[inline(never)]
 fn touch<T: Copy>(v: T) {
@@ -13,8 +13,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(50_000);
 
-    let lt = LocalTrustee::new();
-    let guarded = lt.entrust(Latch::new(0usize));
+    let guarded = Trust::entrust(Latch::new(0usize));
 
     // Warmup to stabilize cache state
     for _ in 0..(iterations / 10).max(1) {

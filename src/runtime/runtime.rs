@@ -4,40 +4,27 @@ use smallvec::SmallVec;
 use std::{sync::Arc, thread};
 
 use crate::{
-    affinity::{PinConfig, pin_current_thread},
-    ring::wait::WaitBudget,
+    runtime::common::{Op, Resp},
+    trust::remote::Remote,
+    util::WaitBudget,
+    util::affinity::{PinConfig, pin_current_thread},
 };
 
-// Remote ops/responses are POD and allocation-free.
-enum RemoteOp<T> {
-    Apply(fn(&mut T)),
-    MapU64(fn(&mut T) -> u64),
-    ApplyBatch(fn(&mut T), u32),
-    // Signal the worker to terminate cleanly.
-    Terminate,
-}
-
-enum RemoteResp {
-    None,
-    U64(u64),
-    NoneBatch(u32),
-}
-
 struct ClientPair<T> {
-    req: Arc<ArrayQueue<RemoteOp<T>>>,
-    resp: Arc<ArrayQueue<RemoteResp>>,
+    req: Arc<ArrayQueue<Op<T>>>,
+    resp: Arc<ArrayQueue<Resp>>,
 }
 
-/// Remote runtime hosting a property `T` on a worker thread and serving clients.
-pub struct RemoteRuntime<T> {
+/// Runtime hosting a property `T` on a worker thread and serving clients.
+pub struct Runtime<T> {
     reg_q: Arc<SegQueue<ClientPair<T>>>,
     capacity: usize,
     _worker: Option<thread::JoinHandle<()>>,
 }
 
-impl<T: Send + 'static> RemoteRuntime<T> {
+impl<T: Send + 'static> Runtime<T> {
     /// Spawn a remote runtime worker thread with default burst and no pinning.
-    pub fn spawn(value: T, capacity: usize) -> (Self, RemoteTrust<T>) {
+    pub fn spawn(value: T, capacity: usize) -> (Self, Remote<T>) {
         Self::spawn_with_pin(value, capacity, 64, None)
     }
 
@@ -47,7 +34,7 @@ impl<T: Send + 'static> RemoteRuntime<T> {
         capacity: usize,
         burst: usize,
         pin: Option<PinConfig>,
-    ) -> (Self, RemoteTrust<T>) {
+    ) -> (Self, Remote<T>) {
         let reg_q = Arc::new(SegQueue::new());
         let worker_reg = reg_q.clone();
 
@@ -102,27 +89,27 @@ impl<T: Send + 'static> RemoteRuntime<T> {
                     };
                     while processed < local_burst {
                         match cp.req.pop() {
-                            Some(RemoteOp::Apply(f)) => {
+                            Some(Op::Apply(f)) => {
                                 f(&mut prop);
-                                let _ = cp.resp.push(RemoteResp::None);
+                                let _ = cp.resp.push(Resp::None);
                                 processed += 1;
                                 progressed = true;
                             }
-                            Some(RemoteOp::MapU64(f)) => {
+                            Some(Op::MapU64(f)) => {
                                 let v = f(&mut prop);
-                                let _ = cp.resp.push(RemoteResp::U64(v));
+                                let _ = cp.resp.push(Resp::U64(v));
                                 processed += 1;
                                 progressed = true;
                             }
-                            Some(RemoteOp::ApplyBatch(f, nrep)) => {
+                            Some(Op::ApplyBatch(f, nrep)) => {
                                 for _ in 0..nrep {
                                     f(&mut prop);
                                 }
-                                let _ = cp.resp.push(RemoteResp::NoneBatch(nrep));
+                                let _ = cp.resp.push(Resp::NoneBatch(nrep));
                                 processed += 1;
                                 progressed = true;
                             }
-                            Some(RemoteOp::Terminate) => {
+                            Some(Op::Terminate) => {
                                 // Break outer loop and exit thread.
                                 return;
                             }
@@ -138,36 +125,30 @@ impl<T: Send + 'static> RemoteRuntime<T> {
                 if progressed {
                     idle_rounds = 0;
                 } else {
-                    if idle_rounds < 8 {
-                        core::hint::spin_loop();
-                        idle_rounds += 1;
-                    } else {
-                        std::thread::yield_now();
-                        idle_rounds = 0;
-                    }
+                    WaitBudget::default().step();
                 }
             }
         });
 
-        let rt = RemoteRuntime {
+        let rt = Runtime {
             reg_q,
             capacity,
             _worker: Some(_worker),
         };
-        let handle = rt.handle();
+        let handle = rt.entrust();
         (rt, handle)
     }
 
     #[inline]
     /// Create a client handle by registering bounded MPMC queues with the worker.
-    pub fn handle(&self) -> RemoteTrust<T> {
+    pub fn entrust(&self) -> Remote<T> {
         let req = Arc::new(ArrayQueue::new(self.capacity));
         let resp = Arc::new(ArrayQueue::new(self.capacity));
         self.reg_q.push(ClientPair {
             req: req.clone(),
             resp: resp.clone(),
         });
-        RemoteTrust {
+        Remote {
             req,
             resp,
             _phantom: PhantomData,
@@ -175,7 +156,7 @@ impl<T: Send + 'static> RemoteRuntime<T> {
     }
 }
 
-impl<T> Drop for RemoteRuntime<T> {
+impl<T> Drop for Runtime<T> {
     fn drop(&mut self) {
         // Ask all registered clients to terminate the worker if any exist.
         // We cannot access clients directly here; instead we register a one-off
@@ -186,84 +167,16 @@ impl<T> Drop for RemoteRuntime<T> {
         {
             let mut budget = WaitBudget::hot();
             loop {
-                if req.push(RemoteOp::Terminate).is_ok() {
+                if req.push(Op::Terminate).is_ok() {
                     break;
                 }
                 budget.step();
             }
         }
         self.reg_q.push(ClientPair { req, resp });
-        // Join the worker to ensure all allocations are torn down before exit.
+
         if let Some(handle) = self._worker.take() {
             let _ = handle.join();
-        }
-    }
-}
-
-/// Client handle to submit operations to a `RemoteRuntime<T>` and await replies.
-pub struct RemoteTrust<T> {
-    req: Arc<ArrayQueue<RemoteOp<T>>>,
-    resp: Arc<ArrayQueue<RemoteResp>>,
-    _phantom: PhantomData<T>,
-}
-
-impl<T: Send + 'static> RemoteTrust<T> {
-    #[inline]
-    /// Apply a mutation on the remote property and wait for completion.
-    pub fn apply_mut(&self, f: fn(&mut T)) {
-        // Push with backoff if full.
-        let mut budget = WaitBudget::hot();
-        loop {
-            if self.req.push(RemoteOp::Apply(f)).is_ok() {
-                break;
-            }
-            budget.step();
-        }
-        // Pop with backoff if empty.
-        let mut budget = WaitBudget::hot();
-        loop {
-            if let Some(RemoteResp::None) = self.resp.pop() {
-                return;
-            }
-            budget.step();
-        }
-    }
-
-    #[inline]
-    /// Apply a function on the remote property and return a `u64` result.
-    pub fn apply_map_u64(&self, f: fn(&mut T) -> u64) -> u64 {
-        let mut budget = WaitBudget::hot();
-        loop {
-            if self.req.push(RemoteOp::MapU64(f)).is_ok() {
-                break;
-            }
-            budget.step();
-        }
-        let mut budget = WaitBudget::hot();
-        loop {
-            if let Some(RemoteResp::U64(v)) = self.resp.pop() {
-                return v;
-            }
-            budget.step();
-        }
-    }
-
-    #[inline]
-    /// Apply a mutation `n` times on the remote property and wait for completion.
-    pub fn apply_batch_mut(&self, f: fn(&mut T), n: u32) {
-        let mut budget = WaitBudget::hot();
-        loop {
-            if self.req.push(RemoteOp::ApplyBatch(f, n)).is_ok() {
-                break;
-            }
-            budget.step();
-        }
-        let mut budget = WaitBudget::hot();
-        loop {
-            if let Some(RemoteResp::NoneBatch(_n)) = self.resp.pop() {
-                return;
-            }
-            budget.step();
         }
     }
 }
