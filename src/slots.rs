@@ -6,7 +6,7 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use branches::unlikely;
+use branches::{likely, unlikely};
 
 const CACHELINE: usize = 64;
 
@@ -167,23 +167,16 @@ impl WaitBudget {
         self.yields = 0;
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn step(&mut self) {
-        if self.spins < self.spin_cap {
+        if likely(self.spins < self.spin_cap) {
             core::hint::spin_loop();
             self.spins += 1;
-            return;
-        }
-        self.step_slow();
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn step_slow(&mut self) {
-        if self.yields < self.yield_cap {
+        } else if likely(self.yields < self.yield_cap) {
             std::thread::yield_now();
             self.yields += 1;
         } else {
+            // Stay hot without parking to avoid scheduler-induced latency.
             core::hint::spin_loop();
         }
     }
