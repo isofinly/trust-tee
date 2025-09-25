@@ -2,6 +2,11 @@ use std::env;
 
 use trust_tee::{Latch, LocalTrustee};
 
+#[inline(never)]
+fn touch<T: Copy>(v: T) {
+    std::hint::black_box(v);
+}
+
 fn main() {
     let iterations: usize = env::var("ITER")
         .ok()
@@ -11,6 +16,14 @@ fn main() {
     let lt = LocalTrustee::new();
     let guarded = lt.entrust(Latch::new(0usize));
 
+    // Warmup to stabilize cache state
+    for _ in 0..(iterations / 10).max(1) {
+        guarded.apply(|l| {
+            let mut g = l.lock();
+            *g += 1;
+        });
+    }
+
     for _ in 0..iterations {
         guarded.apply(|l| {
             let mut g = l.lock();
@@ -19,5 +32,6 @@ fn main() {
     }
 
     let v = guarded.lock_with(|l| *l);
+    touch(v);
     println!("latch_sum={v}");
 }

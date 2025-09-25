@@ -39,3 +39,15 @@ num_cpus = "1.16"
 [[bench]]
 name = "contention"
 harness = false
+
+[[bench]]
+name = "perf_local"
+harness = false
+
+[[bench]]
+name = "perf_latch"
+harness = false
+
+[[bench]]
+name = "perf_pinned_remote"
+harness = false

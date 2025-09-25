@@ -13,8 +13,8 @@ jobs:
     timeout-minutes: 60
 
     env:
-      BENCH_EXAMPLE_NAMES: "perf_local perf_pinned_remote perf_latch"
-      ITER: "1"
+      BENCH_NAMES: "perf_local perf_pinned_remote perf_latch"
+      ITER: "100000"
 
     steps:
       - name: Checkout
@@ -45,20 +45,21 @@ jobs:
           name: test-results
           path: test-results/
 
-      - name: Build examples (profiling)
+      - name: Build benches (profiling)
         shell: bash
         run: |
-          cargo build --all-features --profile profiling --examples
+          cargo bench --no-run --all-features --profile profiling
 
       - name: Run memcheck
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p valgrind-memcheck
-          for name in $BENCH_EXAMPLE_NAMES; do
-            path="target/profiling/examples/${name}"
+          for name in $BENCH_NAMES; do
+            # Cargo bench binaries end up as target/profiling/deps/<name>-*
+            path=$(ls target/profiling/deps/${name}-* 2>/dev/null | head -n1 || true)
             if [[ -z "$path" ]]; then
-              echo "Could not find built binary for $name under target/profiling/deps" >&2
+              echo "Could not find built bench binary for $name under target/profiling/deps" >&2
               exit 1
             fi
             if [[ ! -x "$path" ]]; then
@@ -68,7 +69,7 @@ jobs:
             bin=$(basename "$path")
             log="valgrind-memcheck/${bin}.memcheck.log"
             echo "==> memcheck: $bin"
-            ITER=${ITER} valgrind \
+            ITER=${ITER} CG_ITER=${ITER} valgrind \
               --tool=memcheck \
               --leak-check=full \
               --show-leak-kinds=all \
@@ -90,12 +91,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p cachegrind-annotated
-          mkdir -p cachegrind-raw
-          for name in $BENCH_EXAMPLE_NAMES; do
-            path="target/profiling/examples/${name}"
+          mkdir -p cachegrind-raw cachegrind-annotated
+          for name in $BENCH_NAMES; do
+            path=$(ls target/profiling/deps/${name}-* 2>/dev/null | head -n1 || true)
             if [[ -z "$path" ]]; then
-              echo "Could not find built binary for $name under target/profiling/deps" >&2
+              echo "Could not find built bench binary for $name under target/profiling/deps" >&2
               exit 1
             fi
             if [[ ! -x "$path" ]]; then
@@ -104,10 +104,10 @@ jobs:
             fi
             bin=$(basename "$path")
             raw_out="cachegrind-raw/cachegrind-${bin}.out"
-            ann_out="cachegrind-annotated/${bin}.annotated.txt"
+            ann_out="cachegrind-annotated/cachegrind-${bin}.annotated.txt"
             log="cachegrind-raw/cachegrind-${bin}.log"
             echo "==> cachegrind+cg_annotate: $bin"
-            ITER=${ITER} valgrind \
+            ITER=${ITER} CG_ITER=${ITER} valgrind \
               --tool=cachegrind \
               --trace-children=yes \
               --child-silent-after-fork=yes \

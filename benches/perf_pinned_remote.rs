@@ -2,6 +2,11 @@ use std::env;
 
 use trust_tee::{PinConfig, RemoteRuntime};
 
+#[inline(never)]
+fn touch(v: u64) {
+    std::hint::black_box(v);
+}
+
 fn incr(c: &mut i64) {
     *c += 1;
 }
@@ -30,10 +35,16 @@ fn main() {
 
     let (_rt, handle) = RemoteRuntime::spawn_with_pin(0i64, 1024, 64, Some(pin));
 
+    // Warmup to stabilize cache state
+    for _ in 0..(iterations / 10).max(1) {
+        handle.apply_mut(incr);
+    }
+
     for _ in 0..iterations {
         handle.apply_mut(incr);
     }
 
     let sum = handle.apply_map_u64(|c| *c as u64);
+    touch(sum);
     println!("pinned_remote_sum={sum}");
 }
