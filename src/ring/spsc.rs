@@ -25,6 +25,10 @@ pub struct Spsc<T> {
     tail: Padded<AtomicUsize>,
     // Consumer-only head index (Release write), producer reads with Acquire.
     head: Padded<AtomicUsize>,
+    // Producer-side cached head to reduce cross-core traffic
+    prod_head_cache: Padded<UnsafeCell<usize>>,
+    // Consumer-side cached tail to reduce cross-core traffic
+    cons_tail_cache: Padded<UnsafeCell<usize>>,
     // Power-of-two capacity and mask for index wrap.
     cap: usize,
     mask: usize,
@@ -55,6 +59,14 @@ impl<T> Spsc<T> {
                 val: AtomicUsize::new(0),
                 _pad: Pad([0; CACHELINE]),
             },
+            prod_head_cache: Padded {
+                val: UnsafeCell::new(0),
+                _pad: Pad([0; CACHELINE]),
+            },
+            cons_tail_cache: Padded {
+                val: UnsafeCell::new(0),
+                _pad: Pad([0; CACHELINE]),
+            },
             cap,
             mask,
             buf,
@@ -69,27 +81,36 @@ impl<T> Spsc<T> {
     /// Try to push a value; Err(value) if full.
     #[inline]
     pub fn try_push(&self, value: T) -> Result<(), T> {
-        let head = self.head.val.load(Ordering::Relaxed);
         let tail = self.tail.val.load(Ordering::Relaxed);
-        if tail.wrapping_sub(head) >= self.cap {
-            return Err(value);
+        let next = tail.wrapping_add(1);
+        // Fast-path with cached head; refresh on contention
+        let head_cached = unsafe { &mut *self.prod_head_cache.val.get() };
+        if next.wrapping_sub(*head_cached) > self.cap - 1 {
+            *head_cached = self.head.val.load(Ordering::Acquire);
+            if next.wrapping_sub(*head_cached) > self.cap - 1 {
+                return Err(value);
+            }
         }
         let idx = tail & self.mask;
         // SAFETY: single producer owns this slot before tail is published.
         unsafe {
             (*self.buf[idx].get()).as_mut_ptr().write(value);
         }
-        self.tail.val.store(tail.wrapping_add(1), Ordering::Release);
+        self.tail.val.store(next, Ordering::Release);
         Ok(())
     }
 
     /// Try to pop a value; None if empty.
     #[inline]
     pub fn try_pop(&self) -> Option<T> {
-        let tail = self.tail.val.load(Ordering::Acquire);
         let head = self.head.val.load(Ordering::Relaxed);
-        if head == tail {
-            return None;
+        // Fast-path with cached tail; refresh on contention
+        let tail_cached = unsafe { &mut *self.cons_tail_cache.val.get() };
+        if head == *tail_cached {
+            *tail_cached = self.tail.val.load(Ordering::Acquire);
+            if head == *tail_cached {
+                return None;
+            }
         }
         let idx = head & self.mask;
         // SAFETY: single consumer owns this slot before head is published.
