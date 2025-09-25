@@ -2,13 +2,17 @@
 
 pub struct DelegatedScopeGuard {
     _priv: (),
+    _marker: std::marker::PhantomData<*const ()>,
 }
 
 /// Enter a delegated scope. Used for testing.
 impl DelegatedScopeGuard {
     #[inline]
     pub fn enter() -> Self {
-        Self { _priv: () }
+        Self {
+            _priv: (),
+            _marker: std::marker::PhantomData,
+        }
     }
 }
 

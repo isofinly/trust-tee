@@ -1,10 +1,11 @@
 use core::marker::PhantomData;
+use crossbeam_queue::{ArrayQueue, SegQueue};
 use smallvec::SmallVec;
 use std::{sync::Arc, thread};
 
 use crate::{
     affinity::{PinConfig, pin_current_thread},
-    ring::{spsc::Spsc, wait::WaitBudget},
+    ring::wait::WaitBudget,
 };
 
 // Remote ops/responses are POD and allocation-free.
@@ -23,15 +24,14 @@ enum RemoteResp {
 }
 
 struct ClientPair<T> {
-    req: Arc<Spsc<RemoteOp<T>>>,
-    resp: Arc<Spsc<RemoteResp>>,
+    req: Arc<ArrayQueue<RemoteOp<T>>>,
+    resp: Arc<ArrayQueue<RemoteResp>>,
 }
 
 /// Remote runtime hosting a property `T` on a worker thread and serving clients.
 pub struct RemoteRuntime<T> {
-    reg_q: Arc<Spsc<ClientPair<T>>>,
+    reg_q: Arc<SegQueue<ClientPair<T>>>,
     capacity: usize,
-    burst: usize,
     _worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -48,7 +48,7 @@ impl<T: Send + 'static> RemoteRuntime<T> {
         burst: usize,
         pin: Option<PinConfig>,
     ) -> (Self, RemoteTrust<T>) {
-        let reg_q = Arc::new(Spsc::new(1024));
+        let reg_q = Arc::new(SegQueue::new());
         let worker_reg = reg_q.clone();
 
         let _worker = thread::spawn(move || {
@@ -64,7 +64,7 @@ impl<T: Send + 'static> RemoteRuntime<T> {
                 // Drain registrations in bounded chunks.
                 let mut drained = 0;
                 while drained < 256 {
-                    if let Some(cp) = worker_reg.try_pop() {
+                    if let Some(cp) = worker_reg.pop() {
                         clients.push(cp);
                         drained += 1;
                     } else {
@@ -92,17 +92,25 @@ impl<T: Send + 'static> RemoteRuntime<T> {
                     let cp = &clients[idx];
 
                     let mut processed = 0usize;
-                    while processed < burst {
-                        match cp.req.try_pop() {
+                    let local_burst = {
+                        let pending = cp.req.len();
+                        if pending == 0 {
+                            0
+                        } else {
+                            core::cmp::min(burst, pending)
+                        }
+                    };
+                    while processed < local_burst {
+                        match cp.req.pop() {
                             Some(RemoteOp::Apply(f)) => {
                                 f(&mut prop);
-                                let _ = cp.resp.try_push(RemoteResp::None);
+                                let _ = cp.resp.push(RemoteResp::None);
                                 processed += 1;
                                 progressed = true;
                             }
                             Some(RemoteOp::MapU64(f)) => {
                                 let v = f(&mut prop);
-                                let _ = cp.resp.try_push(RemoteResp::U64(v));
+                                let _ = cp.resp.push(RemoteResp::U64(v));
                                 processed += 1;
                                 progressed = true;
                             }
@@ -110,7 +118,7 @@ impl<T: Send + 'static> RemoteRuntime<T> {
                                 for _ in 0..nrep {
                                     f(&mut prop);
                                 }
-                                let _ = cp.resp.try_push(RemoteResp::NoneBatch(nrep));
+                                let _ = cp.resp.push(RemoteResp::NoneBatch(nrep));
                                 processed += 1;
                                 progressed = true;
                             }
@@ -144,7 +152,6 @@ impl<T: Send + 'static> RemoteRuntime<T> {
         let rt = RemoteRuntime {
             reg_q,
             capacity,
-            burst,
             _worker: Some(_worker),
         };
         let handle = rt.handle();
@@ -152,17 +159,17 @@ impl<T: Send + 'static> RemoteRuntime<T> {
     }
 
     #[inline]
-    /// Create a client handle by registering SPSC queues with the worker.
+    /// Create a client handle by registering bounded MPMC queues with the worker.
     pub fn handle(&self) -> RemoteTrust<T> {
-        let req = Arc::new(Spsc::new(self.capacity));
-        let resp = Arc::new(Spsc::new(self.capacity));
-        self.reg_q.push_backoff(ClientPair {
+        let req = Arc::new(ArrayQueue::new(self.capacity));
+        let resp = Arc::new(ArrayQueue::new(self.capacity));
+        self.reg_q.push(ClientPair {
             req: req.clone(),
             resp: resp.clone(),
         });
         RemoteTrust {
-            req_q: req,
-            resp_q: resp,
+            req,
+            resp,
             _phantom: PhantomData,
         }
     }
@@ -173,13 +180,19 @@ impl<T> Drop for RemoteRuntime<T> {
         // Ask all registered clients to terminate the worker if any exist.
         // We cannot access clients directly here; instead we register a one-off
         // control client and send a Terminate op.
-        let req = Arc::new(Spsc::new(self.capacity));
-        let resp = Arc::new(Spsc::new(self.capacity));
-        self.reg_q.push_backoff(ClientPair {
-            req: req.clone(),
-            resp: resp.clone(),
-        });
-        req.push_backoff(RemoteOp::Terminate);
+        let req = Arc::new(ArrayQueue::new(self.capacity));
+        let resp = Arc::new(ArrayQueue::new(self.capacity));
+        // Best-effort send; if full, spin with small budget.
+        {
+            let mut budget = WaitBudget::hot();
+            loop {
+                if req.push(RemoteOp::Terminate).is_ok() {
+                    break;
+                }
+                budget.step();
+            }
+        }
+        self.reg_q.push(ClientPair { req, resp });
         // Join the worker to ensure all allocations are torn down before exit.
         if let Some(handle) = self._worker.take() {
             let _ = handle.join();
@@ -189,8 +202,8 @@ impl<T> Drop for RemoteRuntime<T> {
 
 /// Client handle to submit operations to a `RemoteRuntime<T>` and await replies.
 pub struct RemoteTrust<T> {
-    req_q: Arc<Spsc<RemoteOp<T>>>,
-    resp_q: Arc<Spsc<RemoteResp>>,
+    req: Arc<ArrayQueue<RemoteOp<T>>>,
+    resp: Arc<ArrayQueue<RemoteResp>>,
     _phantom: PhantomData<T>,
 }
 
@@ -199,11 +212,17 @@ impl<T: Send + 'static> RemoteTrust<T> {
     /// Apply a mutation on the remote property and wait for completion.
     pub fn apply_mut(&self, f: fn(&mut T)) {
         // Push with backoff if full.
-        self.req_q.push_backoff(RemoteOp::Apply(f));
+        let mut budget = WaitBudget::hot();
+        loop {
+            if self.req.push(RemoteOp::Apply(f)).is_ok() {
+                break;
+            }
+            budget.step();
+        }
         // Pop with backoff if empty.
         let mut budget = WaitBudget::hot();
         loop {
-            if let Some(RemoteResp::None) = self.resp_q.try_pop() {
+            if let Some(RemoteResp::None) = self.resp.pop() {
                 return;
             }
             budget.step();
@@ -213,10 +232,16 @@ impl<T: Send + 'static> RemoteTrust<T> {
     #[inline]
     /// Apply a function on the remote property and return a `u64` result.
     pub fn apply_map_u64(&self, f: fn(&mut T) -> u64) -> u64 {
-        self.req_q.push_backoff(RemoteOp::MapU64(f));
         let mut budget = WaitBudget::hot();
         loop {
-            if let Some(RemoteResp::U64(v)) = self.resp_q.try_pop() {
+            if self.req.push(RemoteOp::MapU64(f)).is_ok() {
+                break;
+            }
+            budget.step();
+        }
+        let mut budget = WaitBudget::hot();
+        loop {
+            if let Some(RemoteResp::U64(v)) = self.resp.pop() {
                 return v;
             }
             budget.step();
@@ -226,10 +251,16 @@ impl<T: Send + 'static> RemoteTrust<T> {
     #[inline]
     /// Apply a mutation `n` times on the remote property and wait for completion.
     pub fn apply_batch_mut(&self, f: fn(&mut T), n: u32) {
-        self.req_q.push_backoff(RemoteOp::ApplyBatch(f, n));
         let mut budget = WaitBudget::hot();
         loop {
-            if let Some(RemoteResp::NoneBatch(_n)) = self.resp_q.try_pop() {
+            if self.req.push(RemoteOp::ApplyBatch(f, n)).is_ok() {
+                break;
+            }
+            budget.step();
+        }
+        let mut budget = WaitBudget::hot();
+        loop {
+            if let Some(RemoteResp::NoneBatch(_n)) = self.resp.pop() {
                 return;
             }
             budget.step();

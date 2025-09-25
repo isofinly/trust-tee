@@ -17,4 +17,5 @@ pub use crate::trustee::remote::RemoteRuntime;
 pub use crate::trustee::remote::RemoteTrust;
 pub use affinity::{PinConfig, pin_current_thread};
 pub use latch::Latch;
+// No longer exposing SPSC in the public API; internals now use ArrayQueue.
 pub use trust::*;
