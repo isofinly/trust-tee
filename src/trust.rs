@@ -1,4 +1,4 @@
-use std::cell::UnsafeCell;
+use core::cell::UnsafeCell;
 
 /// A trust over a property `T` executed by its local trustee.
 pub struct Trust<T> {

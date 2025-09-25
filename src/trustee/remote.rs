@@ -2,8 +2,11 @@ use core::marker::PhantomData;
 use smallvec::SmallVec;
 use std::{sync::Arc, thread};
 
-use crate::affinity::{PinConfig, pin_current_thread};
-use crate::slots::{Spsc, WaitBudget};
+use crate::{
+    affinity::{PinConfig, pin_current_thread},
+    ring::{spsc::Spsc, wait::WaitBudget},
+};
+
 // Remote ops/responses are POD and allocation-free.
 enum RemoteOp<T> {
     Apply(fn(&mut T)),

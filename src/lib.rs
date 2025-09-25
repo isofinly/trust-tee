@@ -8,7 +8,7 @@
 mod affinity;
 mod fiber;
 mod latch;
-mod slots;
+mod ring;
 mod trust;
 mod trustee;
 
