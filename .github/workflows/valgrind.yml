@@ -13,10 +13,7 @@ jobs:
     timeout-minutes: 60
 
     env:
-      CARGO_TERM_COLOR: always
-      RUSTFLAGS: -C debuginfo=2 -C force-frame-pointers=yes
-      CARGO_INCREMENTAL: 0
-      BENCH_BIN_NAMES: "perf_local perf_pinned_remote perf_latch"
+      BENCH_EXAMPLE_NAMES: "perf_local perf_pinned_remote perf_latch"
       ITER: "1"
 
     steps:
@@ -28,8 +25,8 @@ jobs:
 
       - name: Install valgrind
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends valgrind
+          sudo apt update
+          sudo apt install valgrind
 
       - name: Run tests normally and capture output
         shell: bash
@@ -48,18 +45,18 @@ jobs:
           name: test-results
           path: test-results/
 
-      - name: Build binaries (profiling)
+      - name: Build examples (profiling)
         shell: bash
         run: |
-          cargo build --workspace --all-features --profile profiling --bins
+          cargo build --all-features --profile profiling --examples
 
-      - name: Run memcheck (perf_local, perf_pinned_remote, perf_latch)
+      - name: Run memcheck
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p valgrind-memcheck
-          for name in $BENCH_BIN_NAMES; do
-            path="target/profiling/${name}"
+          for name in $BENCH_EXAMPLE_NAMES; do
+            path="target/profiling/examples/${name}"
             if [[ -z "$path" ]]; then
               echo "Could not find built binary for $name under target/profiling/deps" >&2
               exit 1
@@ -89,13 +86,14 @@ jobs:
             fi
           done
 
-      - name: Run cachegrind and annotate (perf_local, perf_pinned_remote, perf_latch)
+      - name: Run cachegrind and annotate
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p cachegrind-annotated
-          for name in $BENCH_BIN_NAMES; do
-            path="target/profiling/${name}"
+          mkdir -p cachegrind-raw
+          for name in $BENCH_EXAMPLE_NAMES; do
+            path="target/profiling/examples/${name}"
             if [[ -z "$path" ]]; then
               echo "Could not find built binary for $name under target/profiling/deps" >&2
               exit 1
@@ -105,17 +103,19 @@ jobs:
               exit 1
             fi
             bin=$(basename "$path")
-            raw_out="cachegrind-${bin}.out"
+            raw_out="cachegrind-raw/cachegrind-${bin}.out"
             ann_out="cachegrind-annotated/${bin}.annotated.txt"
+            log="cachegrind-raw/cachegrind-${bin}.log"
             echo "==> cachegrind+cg_annotate: $bin"
             ITER=${ITER} valgrind \
               --tool=cachegrind \
               --trace-children=yes \
               --child-silent-after-fork=yes \
+              --log-file="$log" \
               --cachegrind-out-file="$raw_out" \
               "$path" >/dev/null 2>&1 || true
             if command -v cg_annotate >/dev/null 2>&1; then
-              cg_annotate --demangle=yes --show-percs=yes --threshold=0.10 --auto=yes --show-top=100 "$raw_out" > "$ann_out" || true
+              cg_annotate "$raw_out" > "$ann_out" || true
             else
               echo "cg_annotate missing" > "$ann_out"
             fi
@@ -132,3 +132,9 @@ jobs:
         with:
           name: cachegrind-annotated
           path: cachegrind-annotated/
+
+      - name: Upload cachegrind valgrind logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: valgrind-cachegrind-logs
+          path: cachegrind-raw/
