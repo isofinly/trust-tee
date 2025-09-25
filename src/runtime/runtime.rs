@@ -5,7 +5,7 @@ use std::{sync::Arc, thread};
 
 use crate::{
     runtime::common::{Op, Resp},
-    trust::remote::Remote,
+    trust::remote::Trust,
     util::WaitBudget,
     util::affinity::{PinConfig, pin_current_thread},
 };
@@ -24,7 +24,7 @@ pub struct Runtime<T> {
 
 impl<T: Send + 'static> Runtime<T> {
     /// Spawn a remote runtime worker thread with default burst and no pinning.
-    pub fn spawn(value: T, capacity: usize) -> (Self, Remote<T>) {
+    pub fn spawn(value: T, capacity: usize) -> (Self, Trust<T>) {
         Self::spawn_with_pin(value, capacity, 64, None)
     }
 
@@ -34,7 +34,7 @@ impl<T: Send + 'static> Runtime<T> {
         capacity: usize,
         burst: usize,
         pin: Option<PinConfig>,
-    ) -> (Self, Remote<T>) {
+    ) -> (Self, Trust<T>) {
         let reg_q = Arc::new(SegQueue::new());
         let worker_reg = reg_q.clone();
 
@@ -141,14 +141,14 @@ impl<T: Send + 'static> Runtime<T> {
 
     #[inline]
     /// Create a client handle by registering bounded MPMC queues with the worker.
-    pub fn entrust(&self) -> Remote<T> {
+    pub fn entrust(&self) -> Trust<T> {
         let req = Arc::new(ArrayQueue::new(self.capacity));
         let resp = Arc::new(ArrayQueue::new(self.capacity));
         self.reg_q.push(ClientPair {
             req: req.clone(),
             resp: resp.clone(),
         });
-        Remote {
+        Trust {
             req,
             resp,
             _phantom: PhantomData,

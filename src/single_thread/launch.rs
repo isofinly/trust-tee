@@ -5,7 +5,8 @@ use crate::util::fiber::{DelegatedScopeGuard, enqueue_then};
 impl<U> Trust<Latch<U>> {
     /// Execute `f` inside the latch's critical section on the local trustee.
     ///
-    /// Zero-alloc; panics if re-entered while already holding the latch.
+    /// Zero-alloc;
+    /// TODO: panics if re-entered while already holding the latch.
     #[inline]
     pub fn lock_apply<R>(&self, f: impl FnOnce(&mut U) -> R) -> R {
         let _guard = DelegatedScopeGuard::enter();
@@ -38,5 +39,17 @@ impl<U> Trust<Latch<U>> {
         let latch = unsafe { &mut *self.inner.get() };
         let g = latch.lock();
         f(&*g)
+    }
+
+    /// Launch a function inside the latch's critical section on the local trustee.
+    #[inline]
+    pub fn launch<R>(&self, f: impl FnOnce(&mut U) -> R) -> R {
+        unimplemented!("launch is not implemented")
+    }
+
+    /// Launch + continuation variant; runs `then` immediately after `f`.
+    #[inline]
+    pub fn launch_then<R>(&self, f: impl FnOnce(&mut U) -> R, then: impl FnOnce(R)) {
+        unimplemented!("launch is not implemented")
     }
 }

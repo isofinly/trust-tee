@@ -4,14 +4,14 @@ use core::marker::PhantomData;
 use crossbeam_queue::ArrayQueue;
 use std::sync::Arc;
 
-/// Client RemoteTrust to submit operations to a `Runtime<T>` and await replies.
-pub struct Remote<T> {
+/// Client Remote Trust to submit operations to a `Runtime<T>` and await replies.
+pub struct Trust<T> {
     pub(crate) req: Arc<ArrayQueue<Op<T>>>,
     pub(crate) resp: Arc<ArrayQueue<Resp>>,
     pub(crate) _phantom: PhantomData<T>,
 }
 
-impl<T: Send + 'static> Remote<T> {
+impl<T: Send + 'static> Trust<T> {
     #[inline]
     /// Apply a mutation on the remote property and wait for completion.
     pub fn apply_mut(&self, f: fn(&mut T)) {
