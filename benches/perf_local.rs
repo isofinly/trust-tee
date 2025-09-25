@@ -13,7 +13,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(50_000);
 
-    let counter = Trust::entrust(0i64);
+    let counter = Trust::new(Local::entrust(0i64));
 
     // Warmup to stabilize cache state
     for _ in 0..(iterations / 10).max(1) {

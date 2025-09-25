@@ -11,8 +11,8 @@ fn get(c: &mut i64) -> u64 {
 }
 
 fn main() {
-    // Spawn a trustee thread managing a single counter with bounded queues.
-    let (rt, handle) = Runtime::spawn(0i64, 1024);
+    // Spawn a trustee thread managing a single counter with SPSC queues.
+    let (rt, handle) = Runtime::spawn(0i64);
 
     // Single-threaded usage.
     handle.apply_mut(incr);

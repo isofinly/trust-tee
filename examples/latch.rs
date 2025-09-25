@@ -1,7 +1,7 @@
 use trust_tee::prelude::*;
 
 fn main() {
-    let guarded = Trust::entrust(Latch::new(0usize));
+    let guarded = Trust::new(Local::entrust(Latch::new(0usize)));
 
     // Run inside local trustee apply; take the latch and mutate.
     guarded.apply(|l| {
@@ -17,7 +17,7 @@ fn main() {
 
     // Trust<Latch<T>> helper APIs (local path MVP)
     // 1) lock_apply: mutate under the latch and return a value
-    let len = Trust::entrust(Latch::new(Vec::<u32>::new())).lock_apply(|v| {
+    let len = Trust::new(Local::entrust(Latch::new(Vec::<u32>::new()))).lock_apply(|v| {
         v.push(10);
         v.push(20);
         v.len()
@@ -26,7 +26,7 @@ fn main() {
 
     // 2) lock_apply_then: continuation runs on client (immediate in MVP)
     let mut observed = 0usize;
-    let vec_t = Trust::entrust(Latch::new(Vec::<u8>::new()));
+    let vec_t = Trust::new(Local::entrust(Latch::new(Vec::<u8>::new())));
     vec_t.lock_apply_then(
         |v| {
             v.extend_from_slice(&[1, 2, 3, 4]);

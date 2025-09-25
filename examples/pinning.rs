@@ -24,8 +24,8 @@ fn main() {
         mac_affinity_tag: Some(1),
     };
 
-    // Spawn a pinned trustee with fixed-capacity queues.
-    let (_rt, h) = Runtime::spawn_with_pin(0i64, 1024, 64, Some(pin));
+    // Spawn a pinned trustee with SPSC queues.
+    let (_rt, h) = Runtime::spawn_with_pin(0i64, 64, Some(pin));
 
     h.apply_mut(incr);
     let v = h.apply_map_u64(get);

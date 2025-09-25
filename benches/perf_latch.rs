@@ -13,7 +13,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(50_000);
 
-    let guarded = Trust::entrust(Latch::new(0usize));
+    let guarded = Trust::new(Local::entrust(Latch::new(0usize)));
 
     // Warmup to stabilize cache state
     for _ in 0..(iterations / 10).max(1) {
@@ -32,5 +32,5 @@ fn main() {
 
     let v = guarded.lock_with(|l| *l);
     touch(v);
-    println!("latch_sum={v}");
+    println!("latch_sum={:?}", v);
 }

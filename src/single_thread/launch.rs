@@ -1,8 +1,9 @@
 use crate::single_thread::Latch;
-use crate::trust::Trust;
+use crate::trust::Local;
 use crate::util::fiber::{DelegatedScopeGuard, enqueue_then};
 
-impl<U> Trust<Latch<U>> {
+// TODO: Must be implemented for remote as well
+impl<U> Local<Latch<U>> {
     /// Execute `f` inside the latch's critical section on the local trustee.
     ///
     /// Zero-alloc;

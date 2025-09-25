@@ -2,11 +2,34 @@
 
 use core::cell::{Cell, UnsafeCell};
 use core::ops::{Deref, DerefMut};
+use std::fmt::{Debug, Display};
 
 /// A lightweight, single-threaded mutual exclusion for `T`.
 pub struct Latch<T> {
     locked: Cell<bool>,
     inner: UnsafeCell<T>,
+}
+
+impl<T> Debug for Latch<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Latch {{ locked: {}, inner: {:?} }}",
+            self.locked.get(),
+            self.inner.get()
+        )
+    }
+}
+
+impl<T> Display for Latch<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Latch {{ locked: {}, inner: {:?} }}",
+            self.locked.get(),
+            self.inner.get()
+        )
+    }
 }
 
 unsafe impl<T: Send> Send for Latch<T> {}

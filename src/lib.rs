@@ -23,6 +23,6 @@ pub mod runtime;
 pub mod prelude {
     pub use crate::runtime::Runtime;
     pub use crate::single_thread::Latch;
-    pub use crate::trust::Trust;
+    pub use crate::trust::{Local, Remote, Trust, TrustLike};
     pub use crate::util::{PinConfig, WaitBudget, pin_current_thread};
 }

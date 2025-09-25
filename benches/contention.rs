@@ -110,7 +110,7 @@ fn bench_contention(c: &mut Criterion) {
 
     // 3) LocalTrustee (single-threaded fast path; !Sync prevents shared contention)
     {
-        let t = Trust::entrust(0i64);
+        let t = Trust::new(Local::entrust(0i64));
         group.bench_function("local_trustee", |b| {
             b.iter(|| {
                 t.apply(|c| *c += 1);
@@ -135,7 +135,7 @@ fn bench_contention(c: &mut Criterion) {
             mac_affinity_tag: Some(1),
         };
 
-        let (rt, handle) = Runtime::spawn_with_pin(0i64, 1024, 64, Some(pin_t.clone()));
+        let (rt, handle) = Runtime::spawn_with_pin(0i64, 64, Some(pin_t.clone()));
 
         for &batch in batch_sizes {
             let run = Arc::new(AtomicBool::new(true));

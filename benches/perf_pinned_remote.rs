@@ -33,7 +33,7 @@ fn main() {
         mac_affinity_tag: Some(1),
     };
 
-    let (_rt, handle) = Runtime::spawn_with_pin(0i64, 1024, 64, Some(pin));
+    let (_rt, handle) = Runtime::spawn_with_pin(0i64, 64, Some(pin));
 
     // Warmup to stabilize cache state
     for _ in 0..(iterations / 10).max(1) {

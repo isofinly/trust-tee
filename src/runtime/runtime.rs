@@ -1,41 +1,35 @@
 use core::marker::PhantomData;
-use crossbeam_queue::{ArrayQueue, SegQueue};
+use may::queue::{spmc::Queue as SPMCQueue, spsc::Queue};
 use smallvec::SmallVec;
 use std::{sync::Arc, thread};
 
 use crate::{
     runtime::common::{Op, Resp},
-    trust::remote::Trust,
+    trust::remote::Remote,
     util::WaitBudget,
     util::affinity::{PinConfig, pin_current_thread},
 };
 
 struct ClientPair<T> {
-    req: Arc<ArrayQueue<Op<T>>>,
-    resp: Arc<ArrayQueue<Resp>>,
+    req: Arc<Queue<Op<T>>>,
+    resp: Arc<Queue<Resp>>,
 }
 
 /// Runtime hosting a property `T` on a worker thread and serving clients.
 pub struct Runtime<T> {
-    reg_q: Arc<SegQueue<ClientPair<T>>>,
-    capacity: usize,
+    reg_q: Arc<SPMCQueue<ClientPair<T>>>,
     _worker: Option<thread::JoinHandle<()>>,
 }
 
 impl<T: Send + 'static> Runtime<T> {
     /// Spawn a remote runtime worker thread with default burst and no pinning.
-    pub fn spawn(value: T, capacity: usize) -> (Self, Trust<T>) {
-        Self::spawn_with_pin(value, capacity, 64, None)
+    pub fn spawn(value: T) -> (Self, Remote<T>) {
+        Self::spawn_with_pin(value, 64, None)
     }
 
     /// Spawn a remote runtime worker with explicit `burst` and optional pinning.
-    pub fn spawn_with_pin(
-        value: T,
-        capacity: usize,
-        burst: usize,
-        pin: Option<PinConfig>,
-    ) -> (Self, Trust<T>) {
-        let reg_q = Arc::new(SegQueue::new());
+    pub fn spawn_with_pin(value: T, burst: usize, pin: Option<PinConfig>) -> (Self, Remote<T>) {
+        let reg_q = Arc::new(SPMCQueue::new());
         let worker_reg = reg_q.clone();
 
         let _worker = thread::spawn(move || {
@@ -132,7 +126,6 @@ impl<T: Send + 'static> Runtime<T> {
 
         let rt = Runtime {
             reg_q,
-            capacity,
             _worker: Some(_worker),
         };
         let handle = rt.entrust();
@@ -140,15 +133,15 @@ impl<T: Send + 'static> Runtime<T> {
     }
 
     #[inline]
-    /// Create a client handle by registering bounded MPMC queues with the worker.
-    pub fn entrust(&self) -> Trust<T> {
-        let req = Arc::new(ArrayQueue::new(self.capacity));
-        let resp = Arc::new(ArrayQueue::new(self.capacity));
+    /// Create a client handle by registering SPSC queues with the worker.
+    pub fn entrust(&self) -> Remote<T> {
+        let req = Arc::new(Queue::new());
+        let resp = Arc::new(Queue::new());
         self.reg_q.push(ClientPair {
             req: req.clone(),
             resp: resp.clone(),
         });
-        Trust {
+        Remote {
             req,
             resp,
             _phantom: PhantomData,
@@ -161,18 +154,10 @@ impl<T> Drop for Runtime<T> {
         // Ask all registered clients to terminate the worker if any exist.
         // We cannot access clients directly here; instead we register a one-off
         // control client and send a Terminate op.
-        let req = Arc::new(ArrayQueue::new(self.capacity));
-        let resp = Arc::new(ArrayQueue::new(self.capacity));
-        // Best-effort send; if full, spin with small budget.
-        {
-            let mut budget = WaitBudget::hot();
-            loop {
-                if req.push(Op::Terminate).is_ok() {
-                    break;
-                }
-                budget.step();
-            }
-        }
+        let req = Arc::new(Queue::new());
+        let resp = Arc::new(Queue::new());
+        // SPSC queue is unbounded, so no backoff needed
+        req.push(Op::Terminate);
         self.reg_q.push(ClientPair { req, resp });
 
         if let Some(handle) = self._worker.take() {
