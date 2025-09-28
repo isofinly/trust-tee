@@ -6,13 +6,30 @@ pub trait TrustLike {
     /// Create a new trust instance holding `value`.
     fn entrust(value: Self::Value) -> Self;
     /// Mutably apply `f` to the inner value and return its result.
-    fn apply<R>(&self, f: impl FnOnce(&mut Self::Value) -> R) -> R;
+    /// Only pure values may cross the channel; `F` must be `Send + 'static`.
+    fn apply<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut Self::Value) -> R + Send + 'static,
+        R: Send + 'static;
     /// Apply `f`, then enqueue `then` to run with the result.
-    fn apply_then<R>(&self, f: impl FnOnce(&mut Self::Value) -> R, then: impl FnOnce(R));
-    /// Mutably apply `f` with an extra argument `w`, returning its result.
-    fn apply_with<V, R>(&self, f: impl FnOnce(&mut Self::Value, V) -> R, w: V) -> R;
+    fn apply_then<F, R>(&self, f: F, then: impl FnOnce(R))
+    where
+        F: FnOnce(&mut Self::Value) -> R + Send + 'static,
+        R: Send + 'static;
+    /// Mutably apply `f` with a pure value `w` serialized over the channel.
+    /// `V` must be serde-serializable and -deserializable; no references or pointers may cross.
+    fn apply_with<F, V, R>(&self, f: F, w: V) -> R
+    where
+        F: FnOnce(&mut Self::Value, V) -> R + Send + 'static,
+        V: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+        R: Send + 'static;
     /// Borrow the inner value immutably to compute `R`.
-    fn with<R>(&self, f: impl FnOnce(&Self::Value) -> R) -> R;
+    fn with<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&Self::Value) -> R + Send + 'static,
+        R: Send + 'static;
+    /// Apply a mutation `n` times on the inner value and wait for completion.
+    fn apply_batch_mut(&self, f: fn(&mut Self::Value), n: u8);
 }
 
 /// A generic wrapper around any implementation of `TrustLike`.
@@ -34,23 +51,45 @@ impl<T: TrustLike> Trust<T> {
     }
 
     /// Mutably apply `f` to the inner value and return its result.
-    pub fn apply<R>(&self, f: impl FnOnce(&mut T::Value) -> R) -> R {
-        self.inner.apply(f)
+    pub fn apply<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut T::Value) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.inner.apply::<F, R>(f)
     }
 
     /// Apply `f`, then enqueue `then` to run with the result.
-    pub fn apply_then<R>(&self, f: impl FnOnce(&mut T::Value) -> R, then: impl FnOnce(R)) {
-        self.inner.apply_then(f, then)
+    pub fn apply_then<F, R>(&self, f: F, then: impl FnOnce(R))
+    where
+        F: FnOnce(&mut T::Value) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.inner.apply_then::<F, R>(f, then)
     }
 
     /// Mutably apply `f` with an extra argument `w`, returning its result.
-    pub fn apply_with<V, R>(&self, f: impl FnOnce(&mut T::Value, V) -> R, w: V) -> R {
-        self.inner.apply_with(f, w)
+    pub fn apply_with<F, V, R>(&self, f: F, w: V) -> R
+    where
+        F: FnOnce(&mut T::Value, V) -> R + Send + 'static,
+        V: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+        R: Send + 'static,
+    {
+        self.inner.apply_with::<F, V, R>(f, w)
     }
 
     /// Borrow the inner value immutably to compute `R`.
-    pub fn with<R>(&self, f: impl FnOnce(&T::Value) -> R) -> R {
-        self.inner.with(f)
+    pub fn with<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&T::Value) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.inner.with::<F, R>(f)
+    }
+
+    /// Apply a mutation `n` times on the inner value and wait for completion.
+    pub fn apply_batch_mut(&self, f: fn(&mut T::Value), n: u8) {
+        self.inner.apply_batch_mut(f, n);
     }
 }
 

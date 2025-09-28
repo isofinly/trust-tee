@@ -56,6 +56,7 @@ pub struct RequestRecordHeader {
     pub property_ptr: u64,      // 8
     pub captured_len: u32,      // env byte count
     pub args_len: u32,          // serialized args length
+    pub args_offset: u32,       // offset from slot base to start of args bytes
                                 // trailing bytes: [captured_env][serialized_args]
 }
 

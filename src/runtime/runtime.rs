@@ -28,6 +28,15 @@ pub struct Runtime<T> {
     _worker: Option<thread::JoinHandle<()>>,
 }
 
+impl<T> Clone for Runtime<T> {
+    fn clone(&self) -> Self {
+        Runtime {
+            reg_tx: self.reg_tx.clone(),
+            _worker: None,
+        }
+    }
+}
+
 impl<T: Send + 'static> Runtime<T> {
     /// Spawn a remote runtime worker thread with default burst and no pinning.
     pub fn spawn(value: T) -> (Self, Remote<T>) {
@@ -117,6 +126,28 @@ impl<T: Send + 'static> Runtime<T> {
                                         val.to_le(),
                                     );
                                 }
+                                2 => {
+                                    // Generic return path: pass pointer to response payload to closure.
+                                    let resp_base = cp.chan.response.get() as *mut u8;
+                                    let resp_data = resp_base.add(HEADER_BYTES);
+                                    let _: () = decode_and_call::<(&mut T, *mut u8), ()>(
+                                        &hdr,
+                                        (&mut prop, resp_data),
+                                    );
+                                }
+                                3 => {
+                                    // Serialized-args path: use header-provided args_offset to maintain strict provenance.
+                                    let resp_base = cp.chan.response.get() as *mut u8;
+                                    let resp_data = resp_base.add(HEADER_BYTES);
+                                    let base = cp.chan.request.get() as *mut u8;
+                                    let args_ptr = base.add(hdr.args_offset as usize) as *const u8;
+                                    let args_len = hdr.args_len;
+                                    let _: () =
+                                        decode_and_call::<(&mut T, *mut u8, *const u8, u32), ()>(
+                                            &hdr,
+                                            (&mut prop, resp_data, args_ptr, args_len),
+                                        );
+                                }
                                 TERM_PROP_PTR => {
                                     return;
                                 }
@@ -169,6 +200,8 @@ impl<T: Send + 'static> Runtime<T> {
         Remote {
             chan,
             _phantom: PhantomData,
+            _owner: None,
+            _not_sync: core::marker::PhantomData,
         }
     }
 }
@@ -193,6 +226,7 @@ impl<T> Drop for Runtime<T> {
                     property_ptr: TERM_PROP_PTR,
                     captured_len: 0,
                     args_len: 0,
+                    args_offset: 0,
                 };
                 core::ptr::write_unaligned(hdr_ptr, hdr);
                 let resp_word = (&*chan.response.get())

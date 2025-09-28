@@ -34,17 +34,18 @@ fn main() {
     };
 
     let (_rt, handle) = Runtime::spawn_with_pin(0i64, 64, Some(pin));
+    let trust = Trust::new(handle);
 
     // Warmup to stabilize cache state
     for _ in 0..(iterations / 10).max(1) {
-        handle.apply_mut(incr);
+        trust.apply(incr);
     }
 
     for _ in 0..iterations {
-        handle.apply_mut(incr);
+        trust.apply(incr);
     }
 
-    let sum = handle.apply_map_u64(|c| *c as u64);
+    let sum = trust.apply(|c| *c as u64);
     touch(sum);
     println!("pinned_remote_sum={sum}");
 }

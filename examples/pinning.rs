@@ -24,10 +24,12 @@ fn main() {
         mac_affinity_tag: Some(1),
     };
 
-    // Spawn a pinned trustee with SPSC queues.
     let (_rt, h) = Runtime::spawn_with_pin(0i64, 64, Some(pin));
+    let trust = Trust::new(h);
 
-    h.apply_mut(incr);
-    let v = h.apply_map_u64(get);
+    trust.apply(incr);
+
+    let v = trust.apply(get);
+
     println!("final(remote): {v}");
 }

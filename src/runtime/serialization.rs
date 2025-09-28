@@ -261,7 +261,7 @@ where
     let env_align = align_of::<F>();
 
     // Build vtable locally and place it inside the slot for this record.
-    let (env_ptr, _args_ptr, vt_ptr_any) = unsafe {
+    let (env_ptr, args_ptr_in_slot, vt_ptr_any) = unsafe {
         // Base pointer and current cursor
         let base = out.base;
         let len = out.len;
@@ -280,18 +280,16 @@ where
         let vt_value = ErasedVTable::<Args, Ret> {
             call_once_in_place: |env, args| {
                 // For ZST captures construct a fresh instance; otherwise move from slot
-                unsafe {
-                    if size_of::<F>() == 0 {
-                        let f: F = core::mem::MaybeUninit::<F>::uninit().assume_init();
-                        f(args)
-                    } else {
-                        let f_ptr = env.cast::<F>();
-                        let f: F = ptr::read(f_ptr);
-                        f(args)
-                    }
+                if size_of::<F>() == 0 {
+                    let f: F = core::mem::MaybeUninit::<F>::uninit().assume_init();
+                    f(args)
+                } else {
+                    let f_ptr = env.cast::<F>();
+                    let f: F = ptr::read(f_ptr);
+                    f(args)
                 }
             },
-            drop_in_place: |env| unsafe {
+            drop_in_place: |env| {
                 if size_of::<F>() != 0 {
                     ptr::drop_in_place::<F>(env.cast::<F>());
                 }
@@ -347,6 +345,7 @@ where
         property_ptr,
         captured_len: env_size as u32,
         args_len: serialized_args.len() as u32,
+        args_offset: (args_ptr_in_slot as usize - (out.base as usize)) as u32,
     }
 }
 

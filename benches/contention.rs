@@ -6,6 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+
 use trust_tee::prelude::*;
 
 fn spawn_atomic_hammer(
@@ -110,7 +111,7 @@ fn bench_contention(c: &mut Criterion) {
 
     // 3) LocalTrustee (single-threaded fast path; !Sync prevents shared contention)
     {
-        let t = Trust::new(Local::entrust(0i64));
+        let t = Local::entrust(0i64);
         group.bench_function("local_trustee", |b| {
             b.iter(|| {
                 t.apply(|c| *c += 1);
@@ -135,7 +136,8 @@ fn bench_contention(c: &mut Criterion) {
             mac_affinity_tag: Some(1),
         };
 
-        let (rt, handle) = Runtime::spawn_with_pin(0i64, 64, Some(pin_t.clone()));
+        let (rt, remote) = Runtime::spawn_with_pin(0i64, 64, Some(pin_t.clone()));
+        let trust = Trust::new(remote);
 
         for &batch in batch_sizes {
             let run = Arc::new(AtomicBool::new(true));
@@ -144,6 +146,7 @@ fn bench_contention(c: &mut Criterion) {
                 .map(|i| {
                     let run = Arc::clone(&run);
                     let h = rt.entrust();
+                    let trust = Trust::new(h);
                     #[cfg(target_os = "linux")]
                     let client_pin: Option<PinConfig> = if i == 0 {
                         Some(PinConfig {
@@ -173,7 +176,7 @@ fn bench_contention(c: &mut Criterion) {
                             pin_current_thread(&cfg);
                         }
                         while run.load(Ordering::Relaxed) {
-                            h.apply_batch_mut(incr_i64, batch as u8);
+                            trust.apply_batch_mut(incr_i64, batch as u8);
                             // Yield to let trustee run; avoids perfectly hot spin loops.
                             std::thread::yield_now();
                         }
@@ -186,7 +189,7 @@ fn bench_contention(c: &mut Criterion) {
                 BenchmarkId::new("remote_trustee_batched", format!("w{workers}_b{batch}")),
                 |b| {
                     b.iter(|| {
-                        handle.apply_batch_mut(incr_i64, batch as u8);
+                        trust.apply_batch_mut(incr_i64, batch as u8);
                     });
                 },
             );
