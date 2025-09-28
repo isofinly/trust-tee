@@ -395,11 +395,10 @@ where
 /// let record_start = out.cursor;
 /// let hdr = encode_closure::<_, (u32, u32), u32>(&mut out, 0, |(a,b)| a + b, &tmp);
 ///
-/// // Trustee computes the args slice: immediately after the capture env.
-/// // Use slot base + record_start to be robust even for ZST captures (env pointer may be dangling).
+/// // Trustee computes the args slice using the args_offset from the header.
 /// unsafe {
 ///     let base = out.base;
-///     let args_ptr = base.add(record_start + hdr.captured_len as usize);
+///     let args_ptr = base.add(hdr.args_offset as usize);
 ///     let bytes = core::slice::from_raw_parts(args_ptr, hdr.args_len as usize);
 ///     // Deserialize back to (u32, u32)
 ///     let a = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
