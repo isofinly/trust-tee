@@ -28,8 +28,7 @@ impl<T> super::common::TrustLike for Local<T> {
     #[inline]
     /// Apply `f`, then enqueue `then` to run with the result.
     fn apply_then<R>(&self, f: impl FnOnce(&mut T) -> R, then: impl FnOnce(R)) {
-        let out = self.apply(f);
-        crate::util::fiber::enqueue_then(then, out);
+        then(self.apply(f))
     }
 
     #[inline]

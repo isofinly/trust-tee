@@ -21,7 +21,7 @@ pub mod runtime;
 
 /// Common re-exports for convenient usage.
 pub mod prelude {
-    pub use crate::runtime::Runtime;
+    pub use crate::runtime::*;
     pub use crate::single_thread::Latch;
     pub use crate::trust::{Local, Remote, Trust, TrustLike};
     pub use crate::util::{PinConfig, WaitBudget, pin_current_thread};

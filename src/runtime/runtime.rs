@@ -1,23 +1,30 @@
 use core::marker::PhantomData;
-use may::queue::{spmc::Queue as SPMCQueue, spsc::Queue};
 use smallvec::SmallVec;
-use std::{sync::Arc, thread};
+use std::{
+    sync::{
+        Arc,
+        mpsc::{Receiver, Sender, TryRecvError, channel},
+    },
+    thread,
+};
 
 use crate::{
-    runtime::common::{Op, Resp},
+    runtime::serialization::decode_and_call,
+    runtime::slots::{ChannelPair, FatClosurePtr, HEADER_BYTES, RequestRecordHeader, header},
     trust::remote::Remote,
     util::WaitBudget,
     util::affinity::{PinConfig, pin_current_thread},
 };
+const TERM_PROP_PTR: u64 = u64::MAX;
 
 struct ClientPair<T> {
-    req: Arc<Queue<Op<T>>>,
-    resp: Arc<Queue<Resp>>,
+    chan: Arc<ChannelPair>,
+    _phantom: PhantomData<T>,
 }
 
 /// Runtime hosting a property `T` on a worker thread and serving clients.
 pub struct Runtime<T> {
-    reg_q: Arc<SPMCQueue<ClientPair<T>>>,
+    reg_tx: Sender<ClientPair<T>>,
     _worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -28,9 +35,8 @@ impl<T: Send + 'static> Runtime<T> {
     }
 
     /// Spawn a remote runtime worker with explicit `burst` and optional pinning.
-    pub fn spawn_with_pin(value: T, burst: usize, pin: Option<PinConfig>) -> (Self, Remote<T>) {
-        let reg_q = Arc::new(SPMCQueue::new());
-        let worker_reg = reg_q.clone();
+    pub fn spawn_with_pin(value: T, _burst: usize, pin: Option<PinConfig>) -> (Self, Remote<T>) {
+        let (reg_tx, reg_rx): (Sender<ClientPair<T>>, Receiver<ClientPair<T>>) = channel();
 
         let _worker = thread::spawn(move || {
             if let Some(cfg) = pin {
@@ -45,11 +51,13 @@ impl<T: Send + 'static> Runtime<T> {
                 // Drain registrations in bounded chunks.
                 let mut drained = 0;
                 while drained < 256 {
-                    if let Some(cp) = worker_reg.pop() {
-                        clients.push(cp);
-                        drained += 1;
-                    } else {
-                        break;
+                    match reg_rx.try_recv() {
+                        Ok(cp) => {
+                            clients.push(cp);
+                            drained += 1;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => break,
                     }
                 }
 
@@ -72,48 +80,64 @@ impl<T: Send + 'static> Runtime<T> {
                     let idx = (start_idx + offs) % n;
                     let cp = &clients[idx];
 
-                    let mut processed = 0usize;
-                    let local_burst = {
-                        let pending = cp.req.len();
-                        if pending == 0 {
-                            0
-                        } else {
-                            core::cmp::min(burst, pending)
-                        }
-                    };
-                    while processed < local_burst {
-                        match cp.req.pop() {
-                            Some(Op::Apply(f)) => {
-                                f(&mut prop);
-                                let _ = cp.resp.push(Resp::None);
-                                processed += 1;
-                                progressed = true;
-                            }
-                            Some(Op::MapU64(f)) => {
-                                let v = f(&mut prop);
-                                let _ = cp.resp.push(Resp::U64(v));
-                                processed += 1;
-                                progressed = true;
-                            }
-                            Some(Op::ApplyBatch(f, nrep)) => {
-                                for _ in 0..nrep {
-                                    f(&mut prop);
+                    let req_flags = cp.chan.request.get() as *const core::sync::atomic::AtomicU32;
+                    let resp_flags = cp.chan.response.get() as *const core::sync::atomic::AtomicU32;
+                    let req_word =
+                        unsafe { (*req_flags).load(core::sync::atomic::Ordering::Acquire) };
+                    let resp_word =
+                        unsafe { (*resp_flags).load(core::sync::atomic::Ordering::Acquire) };
+                    let req_ready = header::ready(req_word);
+                    let resp_ready = header::ready(resp_word);
+                    if req_ready == resp_ready {
+                        continue;
+                    }
+
+                    // Process a batch of request records according to the request count.
+                    let req_count = header::count(req_word) as usize;
+                    let mut processed: usize = 0;
+                    unsafe {
+                        let base = cp.chan.request.get() as *mut u8;
+                        let mut record_ptr = base.add(HEADER_BYTES) as *const u8;
+                        for _ in 0..req_count {
+                            let hdr: RequestRecordHeader =
+                                core::ptr::read_unaligned(record_ptr as *const RequestRecordHeader);
+
+                            match hdr.property_ptr {
+                                0 => {
+                                    let _: () =
+                                        decode_and_call::<(&mut T,), ()>(&hdr, (&mut prop,));
                                 }
-                                let _ = cp.resp.push(Resp::NoneBatch(nrep));
-                                processed += 1;
-                                progressed = true;
+                                1 => {
+                                    let val: u64 =
+                                        decode_and_call::<(&mut T,), u64>(&hdr, (&mut prop,));
+                                    let resp_base = cp.chan.response.get() as *mut u8;
+                                    let resp_data = resp_base.add(HEADER_BYTES);
+                                    core::ptr::write_unaligned(
+                                        resp_data.cast::<u64>(),
+                                        val.to_le(),
+                                    );
+                                }
+                                TERM_PROP_PTR => {
+                                    return;
+                                }
+                                _ => {
+                                    let vt = &*(hdr.closure.vtable
+                                        as *const crate::runtime::slots::ErasedVTable<(), ()>);
+                                    (vt.drop_in_place)(hdr.closure.data);
+                                }
                             }
-                            Some(Op::Terminate) => {
-                                // Break outer loop and exit thread.
-                                return;
-                            }
-                            None => break,
+
+                            // Next record header is laid out immediately after previous header table entry.
+                            record_ptr =
+                                record_ptr.add(core::mem::size_of::<RequestRecordHeader>());
+                            processed += 1;
                         }
                     }
 
-                    if processed > 0 {
-                        start_idx = (idx + 1) % n;
-                    }
+                    let new_word = header::pack_ready_count(req_ready, processed as u32);
+                    unsafe { (*resp_flags).store(new_word, core::sync::atomic::Ordering::Release) };
+                    progressed = true;
+                    start_idx = (idx + 1) % n;
                 }
 
                 if progressed {
@@ -125,7 +149,7 @@ impl<T: Send + 'static> Runtime<T> {
         });
 
         let rt = Runtime {
-            reg_q,
+            reg_tx,
             _worker: Some(_worker),
         };
         let handle = rt.entrust();
@@ -133,17 +157,17 @@ impl<T: Send + 'static> Runtime<T> {
     }
 
     #[inline]
-    /// Create a client handle by registering SPSC queues with the worker.
+    /// Create a client handle by registering a channel pair with the worker.
     pub fn entrust(&self) -> Remote<T> {
-        let req = Arc::new(Queue::new());
-        let resp = Arc::new(Queue::new());
-        self.reg_q.push(ClientPair {
-            req: req.clone(),
-            resp: resp.clone(),
-        });
+        let chan = Arc::new(ChannelPair::default());
+        self.reg_tx
+            .send(ClientPair {
+                chan: chan.clone(),
+                _phantom: PhantomData,
+            })
+            .ok();
         Remote {
-            req,
-            resp,
+            chan,
             _phantom: PhantomData,
         }
     }
@@ -151,16 +175,39 @@ impl<T: Send + 'static> Runtime<T> {
 
 impl<T> Drop for Runtime<T> {
     fn drop(&mut self) {
-        // Ask all registered clients to terminate the worker if any exist.
-        // We cannot access clients directly here; instead we register a one-off
-        // control client and send a Terminate op.
-        let req = Arc::new(Queue::new());
-        let resp = Arc::new(Queue::new());
-        // SPSC queue is unbounded, so no backoff needed
-        req.push(Op::Terminate);
-        self.reg_q.push(ClientPair { req, resp });
-
         if let Some(handle) = self._worker.take() {
+            // Send TERM to worker via a temporary registration
+            let chan = Arc::new(ChannelPair::default());
+            let _ = self.reg_tx.send(ClientPair {
+                chan: chan.clone(),
+                _phantom: PhantomData,
+            });
+            unsafe {
+                let base = chan.request.get() as *mut u8;
+                let hdr_ptr = base.add(HEADER_BYTES) as *mut RequestRecordHeader;
+                let hdr = RequestRecordHeader {
+                    closure: FatClosurePtr {
+                        data: core::ptr::null_mut(),
+                        vtable: core::ptr::null(),
+                    },
+                    property_ptr: TERM_PROP_PTR,
+                    captured_len: 0,
+                    args_len: 0,
+                };
+                core::ptr::write_unaligned(hdr_ptr, hdr);
+                let resp_word = (&*chan.response.get())
+                    .primary
+                    .header
+                    .flags
+                    .load(core::sync::atomic::Ordering::Acquire);
+                let req_ready = !header::ready(resp_word);
+                let word = header::pack_ready_count(req_ready, 1);
+                (&*chan.request.get())
+                    .primary
+                    .header
+                    .flags
+                    .store(word, core::sync::atomic::Ordering::Release);
+            }
             let _ = handle.join();
         }
     }

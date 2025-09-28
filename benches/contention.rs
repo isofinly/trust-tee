@@ -173,7 +173,7 @@ fn bench_contention(c: &mut Criterion) {
                             pin_current_thread(&cfg);
                         }
                         while run.load(Ordering::Relaxed) {
-                            h.apply_batch_mut(incr_i64, batch);
+                            h.apply_batch_mut(incr_i64, batch as u8);
                             // Yield to let trustee run; avoids perfectly hot spin loops.
                             std::thread::yield_now();
                         }
@@ -186,7 +186,7 @@ fn bench_contention(c: &mut Criterion) {
                 BenchmarkId::new("remote_trustee_batched", format!("w{workers}_b{batch}")),
                 |b| {
                     b.iter(|| {
-                        handle.apply_batch_mut(incr_i64, batch);
+                        handle.apply_batch_mut(incr_i64, batch as u8);
                     });
                 },
             );

@@ -44,13 +44,13 @@ impl<U> Local<Latch<U>> {
 
     /// Launch a function inside the latch's critical section on the local trustee.
     #[inline]
-    pub fn launch<R>(&self, f: impl FnOnce(&mut U) -> R) -> R {
+    pub fn launch<R>(&self, _f: impl FnOnce(&mut U) -> R) -> R {
         unimplemented!("launch is not implemented")
     }
 
     /// Launch + continuation variant; runs `then` immediately after `f`.
     #[inline]
-    pub fn launch_then<R>(&self, f: impl FnOnce(&mut U) -> R, then: impl FnOnce(R)) {
+    pub fn launch_then<R>(&self, _f: impl FnOnce(&mut U) -> R, _then: impl FnOnce(R)) {
         unimplemented!("launch is not implemented")
     }
 }
