@@ -15,6 +15,7 @@ jobs:
     env:
       BENCH_NAMES: "perf_local perf_pinned_remote perf_latch"
       ITER: "100000"
+      RUST_BACKTRACE: 0
 
     steps:
       - name: Checkout
@@ -27,23 +28,6 @@ jobs:
         run: |
           sudo apt update
           sudo apt install valgrind
-
-      - name: Run tests normally and capture output
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p test-results
-          if cargo test --workspace --all-features --profile profiling -- --quiet --nocapture | tee test-results/tests-output.txt; then
-            echo ok > test-results/status
-          else
-            echo failed > test-results/status
-          fi
-
-      - name: Upload test results
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results
-          path: test-results/
 
       - name: Build benches (profiling)
         shell: bash
