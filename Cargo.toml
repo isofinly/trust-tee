@@ -17,7 +17,6 @@ sptr = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 bincode = { version = "1.0.1" }
 
-
 [features]
 default = []
 

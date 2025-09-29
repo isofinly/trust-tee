@@ -1,12 +1,10 @@
 use core::marker::PhantomData;
+#[cfg(not(miri))]
+use may::queue::mpsc;
 use smallvec::SmallVec;
-use std::{
-    sync::{
-        Arc,
-        mpsc::{Receiver, Sender, TryRecvError, channel},
-    },
-    thread,
-};
+#[cfg(miri)]
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::{sync::Arc, thread};
 
 use crate::{
     runtime::serialization::decode_and_call,
@@ -25,6 +23,9 @@ struct ClientPair<T> {
 
 /// Runtime hosting a property `T` on a worker thread and serving clients.
 pub struct Runtime<T> {
+    #[cfg(not(miri))]
+    reg: Arc<mpsc::Queue<ClientPair<T>>>,
+    #[cfg(miri)]
     reg_tx: Sender<ClientPair<T>>,
     _worker: Option<thread::JoinHandle<()>>,
 }
@@ -32,6 +33,9 @@ pub struct Runtime<T> {
 impl<T> Clone for Runtime<T> {
     fn clone(&self) -> Self {
         Runtime {
+            #[cfg(not(miri))]
+            reg: self.reg.clone(),
+            #[cfg(miri)]
             reg_tx: self.reg_tx.clone(),
             _worker: None,
         }
@@ -46,6 +50,12 @@ impl<T: Send + 'static> Runtime<T> {
 
     /// Spawn a remote runtime worker with explicit `burst` and optional pinning.
     pub fn spawn_with_pin(value: T, _burst: usize, pin: Option<PinConfig>) -> (Self, Remote<T>) {
+        #[cfg(not(miri))]
+        let reg: Arc<mpsc::Queue<ClientPair<T>>> = Arc::new(mpsc::Queue::new());
+        #[cfg(not(miri))]
+        let reg_consumer = reg.clone();
+
+        #[cfg(miri)]
         let (reg_tx, reg_rx): (Sender<ClientPair<T>>, Receiver<ClientPair<T>>) = channel();
 
         let _worker = thread::spawn(move || {
@@ -61,13 +71,26 @@ impl<T: Send + 'static> Runtime<T> {
                 // Drain registrations in bounded chunks.
                 let mut drained = 0;
                 while drained < 256 {
-                    match reg_rx.try_recv() {
-                        Ok(cp) => {
-                            clients.push(cp);
-                            drained += 1;
+                    #[cfg(not(miri))]
+                    {
+                        match reg_consumer.pop() {
+                            Some(cp) => {
+                                clients.push(cp);
+                                drained += 1;
+                            }
+                            None => break,
                         }
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => break,
+                    }
+                    #[cfg(miri)]
+                    {
+                        match reg_rx.try_recv() {
+                            Ok(cp) => {
+                                clients.push(cp);
+                                drained += 1;
+                            }
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => break,
+                        }
                     }
                 }
 
@@ -190,6 +213,9 @@ impl<T: Send + 'static> Runtime<T> {
         });
 
         let rt = Runtime {
+            #[cfg(not(miri))]
+            reg,
+            #[cfg(miri)]
             reg_tx,
             _worker: Some(_worker),
         };
@@ -201,12 +227,18 @@ impl<T: Send + 'static> Runtime<T> {
     /// Create a client handle by registering a channel pair with the worker.
     pub fn entrust(&self) -> Remote<T> {
         let chan = Arc::new(ChannelPair::default());
-        self.reg_tx
-            .send(ClientPair {
+        #[cfg(not(miri))]
+        self.reg.push(ClientPair {
+            chan: chan.clone(),
+            _phantom: PhantomData,
+        });
+        #[cfg(miri)]
+        {
+            let _ = self.reg_tx.send(ClientPair {
                 chan: chan.clone(),
                 _phantom: PhantomData,
-            })
-            .ok();
+            });
+        }
         Remote {
             chan,
             _phantom: PhantomData,
@@ -221,10 +253,18 @@ impl<T> Drop for Runtime<T> {
         if let Some(handle) = self._worker.take() {
             // Send TERM to worker via a temporary registration
             let chan = Arc::new(ChannelPair::default());
-            let _ = self.reg_tx.send(ClientPair {
+            #[cfg(not(miri))]
+            self.reg.push(ClientPair {
                 chan: chan.clone(),
                 _phantom: PhantomData,
             });
+            #[cfg(miri)]
+            {
+                let _ = self.reg_tx.send(ClientPair {
+                    chan: chan.clone(),
+                    _phantom: PhantomData,
+                });
+            }
             unsafe {
                 let base = chan.request.get() as *mut u8;
                 let hdr_ptr = base.add(HEADER_BYTES) as *mut RequestRecordHeader;
