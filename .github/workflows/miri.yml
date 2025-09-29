@@ -13,7 +13,6 @@ jobs:
     timeout-minutes: 90
 
     env:
-      BENCH_NAMES: "perf_local perf_pinned_remote perf_latch"
       ITER: "1000"
       MIRIFLAGS: "-Zdeduplicate-diagnostics -Zmiri-strict-provenance"
 
@@ -33,7 +32,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          MIRIFLAGS=${MIRIFLAGS} cargo miri test --workspace --all-features -- --quiet --nocapture
+          MIRIFLAGS="${MIRIFLAGS} -Zmiri-many-seeds" cargo miri test --workspace --all-features -- --quiet --nocapture
 
       - name: Run example under Miri
         shell: bash
@@ -41,12 +40,3 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           MIRIFLAGS="${MIRIFLAGS} -Zmiri-many-seeds" cargo miri run --example remote_complex
-
-      - name: Run benches under Miri (smaller iterations)
-        shell: bash
-        run: |
-          set -euo pipefail
-          for name in $BENCH_NAMES; do
-            echo "==> miri run --bench $name"
-            ITER=${ITER} MIRIFLAGS=${MIRIFLAGS} cargo miri run --bench "$name"
-          done

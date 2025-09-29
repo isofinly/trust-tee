@@ -129,7 +129,7 @@ fn main() {
     // 5. Stress test with rapid concurrent operations
     let mut stress_handles = Vec::new();
 
-    for i in 0..10 {
+    for _ in 0..10 {
         let bank_worker = bank.clone();
         let handle = thread::spawn(move || {
             let mut success_count = 0;

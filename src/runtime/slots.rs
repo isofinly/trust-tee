@@ -52,12 +52,11 @@ pub struct FatClosurePtr {
 
 #[repr(C)]
 pub struct RequestRecordHeader {
-    pub closure: FatClosurePtr,    // 16
-    pub property_ptr: PropertyPtr, // 8
-    pub captured_len: u32,         // env byte count
-    pub args_len: u32,             // serialized args length
-    pub args_offset: u32,          // offset from slot base to start of args bytes
-                                   // trailing bytes: [captured_env][serialized_args]
+    pub closure: FatClosurePtr,
+    pub property_ptr: PropertyPtr,
+    pub captured_len: u32,
+    pub args_len: u32,
+    pub args_offset: u32,
 }
 
 #[repr(u64)]
