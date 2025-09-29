@@ -16,6 +16,13 @@ pub struct PinConfig {
 /// Apply thread pinning and/or memory policy according to `cfg` for the
 /// current thread. Platform fields are honored per target OS.
 pub fn pin_current_thread(cfg: &PinConfig) {
+    // Under Miri, FFI for thread affinity and mempolicy is not supported.
+    // Make this a no-op to allow UB checking of higher-level code.
+    #[cfg(miri)]
+    {
+        let _ = cfg;
+        return;
+    }
     #[cfg(target_os = "linux")]
     {
         use core::mem::{size_of, zeroed};

@@ -1,8 +1,7 @@
-use trust_tee::LocalTrustee;
+use trust_tee::prelude::*;
 
 fn main() {
-    let lt = LocalTrustee::new();
-    let counter = lt.entrust(17i64);
+    let counter = Local::entrust(17i64);
 
     // Increment twice synchronously.
     counter.apply(|c| *c += 1);
