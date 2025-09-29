@@ -40,6 +40,21 @@ impl WaitBudget {
             core::hint::spin_loop();
         }
     }
+
+    /// Helper function to acquire a lock using WaitBudget for efficient spinning/yielding
+    #[inline]
+    pub fn acquire_lock_with_budget<F, R>(mut acquire_fn: F)
+    where
+        F: FnMut() -> Result<R, R>,
+    {
+        let mut budget = WaitBudget::hot();
+        loop {
+            match acquire_fn() {
+                Ok(_value) => break,
+                Err(_) => budget.step(),
+            }
+        }
+    }
 }
 
 impl Default for WaitBudget {

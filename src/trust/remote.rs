@@ -47,19 +47,14 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
     {
         unsafe {
             // Acquire client-side lock to serialize access to request slot across clones.
-            while self
-                .chan
-                .client_lock
-                .compare_exchange(
+            WaitBudget::acquire_lock_with_budget(|| {
+                self.chan.client_lock.compare_exchange(
                     false,
                     true,
                     core::sync::atomic::Ordering::Acquire,
                     core::sync::atomic::Ordering::Relaxed,
                 )
-                .is_err()
-            {
-                core::hint::spin_loop();
-            }
+            });
             // Ensure lock is released on all paths.
             struct Guard<'a>(&'a core::sync::atomic::AtomicBool);
             impl<'a> Drop for Guard<'a> {
@@ -132,19 +127,14 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
         R: Send + 'static,
     {
         unsafe {
-            while self
-                .chan
-                .client_lock
-                .compare_exchange(
+            WaitBudget::acquire_lock_with_budget(|| {
+                self.chan.client_lock.compare_exchange(
                     false,
                     true,
                     core::sync::atomic::Ordering::Acquire,
                     core::sync::atomic::Ordering::Relaxed,
                 )
-                .is_err()
-            {
-                core::hint::spin_loop();
-            }
+            });
             struct Guard<'a>(&'a core::sync::atomic::AtomicBool);
             impl<'a> Drop for Guard<'a> {
                 fn drop(&mut self) {
@@ -204,19 +194,14 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
         R: Send + 'static,
     {
         unsafe {
-            while self
-                .chan
-                .client_lock
-                .compare_exchange(
+            WaitBudget::acquire_lock_with_budget(|| {
+                self.chan.client_lock.compare_exchange(
                     false,
                     true,
                     core::sync::atomic::Ordering::Acquire,
                     core::sync::atomic::Ordering::Relaxed,
                 )
-                .is_err()
-            {
-                core::hint::spin_loop();
-            }
+            });
             struct Guard<'a>(&'a core::sync::atomic::AtomicBool);
             impl<'a> Drop for Guard<'a> {
                 fn drop(&mut self) {
@@ -270,19 +255,14 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
     fn apply_batch_mut(&self, f: fn(&mut T), n: u8) {
         // Delegate to the existing apply_batch_mut implementation
         unsafe {
-            while self
-                .chan
-                .client_lock
-                .compare_exchange(
+            WaitBudget::acquire_lock_with_budget(|| {
+                self.chan.client_lock.compare_exchange(
                     false,
                     true,
                     core::sync::atomic::Ordering::Acquire,
                     core::sync::atomic::Ordering::Relaxed,
                 )
-                .is_err()
-            {
-                core::hint::spin_loop();
-            }
+            });
             struct Guard<'a>(&'a core::sync::atomic::AtomicBool);
             impl<'a> Drop for Guard<'a> {
                 fn drop(&mut self) {
@@ -402,19 +382,14 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
             "Remote::into_inner requires owned runtime"
         );
         unsafe {
-            while self
-                .chan
-                .client_lock
-                .compare_exchange(
+            WaitBudget::acquire_lock_with_budget(|| {
+                self.chan.client_lock.compare_exchange(
                     false,
                     true,
                     core::sync::atomic::Ordering::Acquire,
                     core::sync::atomic::Ordering::Relaxed,
                 )
-                .is_err()
-            {
-                core::hint::spin_loop();
-            }
+            });
             struct Guard<'a>(&'a core::sync::atomic::AtomicBool);
             impl<'a> Drop for Guard<'a> {
                 fn drop(&mut self) {
