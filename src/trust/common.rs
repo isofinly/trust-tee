@@ -5,6 +5,8 @@ pub trait TrustLike {
 
     /// Create a new trust instance holding `value`.
     fn entrust(value: Self::Value) -> Self;
+    /// Get underlying value and drop the trust instance.
+    fn into_inner(self) -> Self::Value;
     /// Mutably apply `f` to the inner value and return its result.
     /// Only pure values may cross the channel; `F` must be `Send + 'static`.
     fn apply<F, R>(&self, f: F) -> R
@@ -34,7 +36,7 @@ pub trait TrustLike {
 
 /// A generic wrapper around any implementation of `TrustLike`.
 pub struct Trust<T: TrustLike> {
-    inner: T,
+    pub(crate) inner: T,
 }
 
 impl<T: TrustLike> Trust<T> {
@@ -43,11 +45,9 @@ impl<T: TrustLike> Trust<T> {
         Self { inner }
     }
 
-    /// Create a new `Trust<T>` by entrusting a value to the implementation.
-    pub fn entrust(value: T::Value) -> Self {
-        Self {
-            inner: T::entrust(value),
-        }
+    /// Get underlying value and drop the trust instance.
+    pub fn into_inner(self) -> T::Value {
+        self.inner.into_inner()
     }
 
     /// Mutably apply `f` to the inner value and return its result.
@@ -93,29 +93,69 @@ impl<T: TrustLike> Trust<T> {
     }
 }
 
-// Specialized implementations for Latch<T>
-impl<U> Trust<crate::trust::Local<crate::single_thread::Latch<U>>> {
-    /// Execute `f` inside the latch's critical section on the local trustee.
-    #[inline]
-    pub fn lock_apply<R>(&self, f: impl FnOnce(&mut U) -> R) -> R {
-        self.inner.lock_apply(f)
+impl<T: TrustLike> core::fmt::Display for Trust<T>
+where
+    T::Value: core::fmt::Display,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = self.inner.with(|v| format!("{}", v));
+        f.write_str(&s)
+    }
+}
+
+impl<T: TrustLike> core::fmt::Debug for Trust<T>
+where
+    T::Value: core::fmt::Debug,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = self.inner.with(|v| format!("{:?}", v));
+        f.debug_tuple("Trust").field(&s).finish()
+    }
+}
+
+// Specialized implementations for typed construction
+impl<T> Trust<super::local::Local<T>> {
+    /// Create a new `Trust<Local<T>>` holding `value` managed by the local trustee.
+    pub fn entrust(value: T) -> Self {
+        Self {
+            inner: super::local::Local::entrust(value),
+        }
+    }
+}
+
+impl<T: Send + 'static> Trust<super::remote::Remote<T>> {
+    /// Create a new `Trust<Remote<T>>` holding `value` managed by a remote trustee.
+    pub fn entrust(value: T) -> Self {
+        Self {
+            inner: super::remote::Remote::entrust(value),
+        }
     }
 
-    /// Lock + continuation variant; runs `then` immediately after `f`.
-    #[inline]
-    pub fn lock_apply_then<R>(&self, f: impl FnOnce(&mut U) -> R, then: impl FnOnce(R)) {
-        self.inner.lock_apply_then(f, then)
+    /// Create a new `Trust<Remote<T>>` with pinning configuration for the worker thread.
+    pub fn entrust_with_pin(value: T, pin: crate::util::affinity::PinConfig) -> Self {
+        use crate::runtime::Runtime;
+        let (rt, handle) = Runtime::spawn_with_pin(value, 64, Some(pin));
+        Self {
+            inner: super::remote::Remote {
+                chan: handle.chan.clone(),
+                _phantom: core::marker::PhantomData,
+                _owner: Some(rt),
+                _not_sync: core::marker::PhantomData,
+            },
+        }
     }
+}
 
-    /// Lock + an explicit out-of-band argument; no serialization on local path.
-    #[inline]
-    pub fn lock_apply_with<V, R>(&self, f: impl FnOnce(&mut U, V) -> R, w: V) -> R {
-        self.inner.lock_apply_with(f, w)
-    }
+// Type aliases for convenience
+/// A trust that manages values locally without cross-thread communication.
+pub type Local<T> = Trust<super::local::Local<T>>;
+/// A trust that manages values remotely using cross-thread communication.
+pub type Remote<T> = Trust<super::remote::Remote<T>>;
 
-    /// Inspect immutably while holding the latch; handy for diagnostics/tests.
-    #[inline]
-    pub fn lock_with<R>(&self, f: impl FnOnce(&U) -> R) -> R {
-        self.inner.lock_with(f)
+impl<T: Send + 'static> Clone for Trust<super::remote::Remote<T>> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
     }
 }

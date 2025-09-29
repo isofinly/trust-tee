@@ -10,7 +10,7 @@ fn main() {
     let msg = String::from("hello");
     let header = encode_closure::<_, (), String>(
         &mut req,
-        /*property_ptr*/ 0,
+        PropertyPtr::CallMutRetUnit,
         move |_| msg + " world", // FnOnce consumes msg
         &[],
     );

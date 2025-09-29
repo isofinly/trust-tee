@@ -1,7 +1,7 @@
 use trust_tee::prelude::*;
 
 fn main() {
-    let local_trust = Trust::new(Local::entrust(42u32));
+    let local_trust = Local::entrust(42u32);
 
     let result = local_trust.apply(|x| {
         *x += 1;
@@ -9,7 +9,7 @@ fn main() {
     });
     println!("Local result: {}", result);
 
-    let latch_trust = Trust::new(Local::entrust(Latch::new(100u32)));
+    let latch_trust = Local::entrust(Latch::new(100u32));
 
     let latch_result = latch_trust.lock_apply(|x| {
         *x += 10;
@@ -17,14 +17,12 @@ fn main() {
     });
     println!("Latch result: {}", latch_result);
 
-    let (runtime, remote_trust) = Runtime::spawn(200u32);
-    let trust = Trust::new(remote_trust);
+    let remote_trust = Remote::entrust(200u32);
 
-    trust.apply(|x| *x += 1);
-    let remote_result = trust.apply(|x| *x as u64);
+    remote_trust.apply(|x| *x += 1);
+    let remote_result = remote_trust.apply(|x| *x as u64);
 
     println!("Remote result: {}", remote_result);
 
-    // Runtime will be dropped and cleaned up here
-    drop(runtime);
+    // Runtime will be dropped and cleaned up when remote_trust is dropped
 }

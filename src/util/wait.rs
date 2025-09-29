@@ -40,9 +40,10 @@ impl WaitBudget {
             core::hint::spin_loop();
         }
     }
+}
 
-    /// Create a default wait budget with moderate settings.
-    pub fn default() -> Self {
+impl Default for WaitBudget {
+    fn default() -> Self {
         Self {
             spins: 0,
             yields: 0,

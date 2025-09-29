@@ -24,7 +24,6 @@ fn main() {
         mem_bind: true,
         mac_affinity_tag: None,
     };
-
     #[cfg(target_os = "macos")]
     let pin = PinConfig {
         core_id: None,
@@ -33,8 +32,7 @@ fn main() {
         mac_affinity_tag: Some(1),
     };
 
-    let (_rt, handle) = Runtime::spawn_with_pin(0i64, 64, Some(pin));
-    let trust = Trust::new(handle);
+    let trust = Remote::entrust_with_pin(0i64, pin);
 
     // Warmup to stabilize cache state
     for _ in 0..(iterations / 10).max(1) {

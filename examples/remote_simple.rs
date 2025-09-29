@@ -11,14 +11,13 @@ fn get(c: &mut i64) -> u64 {
 }
 
 fn main() {
-    let (rt, handle) = Runtime::spawn(0i64);
-    let trust = Trust::new(handle);
+    let trust = Remote::entrust(0i64);
 
     trust.apply(incr);
     let v = trust.apply(get);
     assert_eq!(v, 1);
 
-    let h2 = rt.entrust();
+    let h2 = trust.clone();
     let t1 = thread::spawn({
         let h = h2;
         move || {
@@ -28,7 +27,7 @@ fn main() {
         }
     });
 
-    let h3 = rt.entrust();
+    let h3 = trust.clone();
     let t2 = thread::spawn({
         let h = h3;
         move || {

@@ -10,12 +10,13 @@ use std::{
 
 use crate::{
     runtime::serialization::decode_and_call,
-    runtime::slots::{ChannelPair, FatClosurePtr, HEADER_BYTES, RequestRecordHeader, header},
+    runtime::slots::{
+        ChannelPair, FatClosurePtr, HEADER_BYTES, PropertyPtr, RequestRecordHeader, header,
+    },
     trust::remote::Remote,
     util::WaitBudget,
     util::affinity::{PinConfig, pin_current_thread},
 };
-const TERM_PROP_PTR: u64 = u64::MAX;
 
 struct ClientPair<T> {
     chan: Arc<ChannelPair>,
@@ -112,21 +113,11 @@ impl<T: Send + 'static> Runtime<T> {
                                 core::ptr::read_unaligned(record_ptr as *const RequestRecordHeader);
 
                             match hdr.property_ptr {
-                                0 => {
+                                PropertyPtr::CallMutRetUnit => {
                                     let _: () =
                                         decode_and_call::<(&mut T,), ()>(&hdr, (&mut prop,));
                                 }
-                                1 => {
-                                    let val: u64 =
-                                        decode_and_call::<(&mut T,), u64>(&hdr, (&mut prop,));
-                                    let resp_base = cp.chan.response.get() as *mut u8;
-                                    let resp_data = resp_base.add(HEADER_BYTES);
-                                    core::ptr::write_unaligned(
-                                        resp_data.cast::<u64>(),
-                                        val.to_le(),
-                                    );
-                                }
-                                2 => {
+                                PropertyPtr::CallMutOutPtr => {
                                     // Generic return path: pass pointer to response payload to closure.
                                     let resp_base = cp.chan.response.get() as *mut u8;
                                     let resp_data = resp_base.add(HEADER_BYTES);
@@ -135,7 +126,7 @@ impl<T: Send + 'static> Runtime<T> {
                                         (&mut prop, resp_data),
                                     );
                                 }
-                                3 => {
+                                PropertyPtr::CallMutArgsOutPtr => {
                                     // Serialized-args path: use header-provided args_offset to maintain strict provenance.
                                     let resp_base = cp.chan.response.get() as *mut u8;
                                     let resp_data = resp_base.add(HEADER_BYTES);
@@ -148,13 +139,32 @@ impl<T: Send + 'static> Runtime<T> {
                                             (&mut prop, resp_data, args_ptr, args_len),
                                         );
                                 }
-                                TERM_PROP_PTR => {
+                                PropertyPtr::IntoInner => {
+                                    // Move the inner T into the response buffer, signal, then terminate.
+                                    let resp_base = cp.chan.response.get() as *mut u8;
+                                    let resp_data = resp_base.add(HEADER_BYTES);
+                                    // Move out of prop and write into response payload
+                                    core::ptr::write_unaligned(
+                                        resp_data.cast::<T>(),
+                                        core::ptr::read(&mut prop as *mut T),
+                                    );
+
+                                    // Toggle response ready bit to match current request and set count=1
+                                    let req_flags = cp.chan.request.get()
+                                        as *const core::sync::atomic::AtomicU32;
+                                    let resp_flags = cp.chan.response.get()
+                                        as *const core::sync::atomic::AtomicU32;
+                                    let req_word_now = {
+                                        (*req_flags).load(core::sync::atomic::Ordering::Acquire)
+                                    };
+                                    let req_ready_now = header::ready(req_word_now);
+                                    let new_word = header::pack_ready_count(req_ready_now, 1);
+                                    (*resp_flags)
+                                        .store(new_word, core::sync::atomic::Ordering::Release);
                                     return;
                                 }
-                                _ => {
-                                    let vt = &*(hdr.closure.vtable
-                                        as *const crate::runtime::slots::ErasedVTable<(), ()>);
-                                    (vt.drop_in_place)(hdr.closure.data);
+                                PropertyPtr::Terminate => {
+                                    return;
                                 }
                             }
 
@@ -223,7 +233,7 @@ impl<T> Drop for Runtime<T> {
                         data: core::ptr::null_mut(),
                         vtable: core::ptr::null(),
                     },
-                    property_ptr: TERM_PROP_PTR,
+                    property_ptr: PropertyPtr::Terminate,
                     captured_len: 0,
                     args_len: 0,
                     args_offset: 0,

@@ -24,8 +24,7 @@ fn main() {
         mac_affinity_tag: Some(1),
     };
 
-    let (_rt, h) = Runtime::spawn_with_pin(0i64, 64, Some(pin));
-    let trust = Trust::new(h);
+    let trust = Remote::entrust_with_pin(0i64, pin);
 
     trust.apply(incr);
 

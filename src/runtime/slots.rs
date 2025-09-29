@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 #![allow(missing_docs)]
 use core::cell::UnsafeCell;
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicBool, AtomicU32};
 
 #[repr(align(64))]
 pub struct Aligned<const N: usize>(pub [u8; N]);
@@ -52,12 +52,22 @@ pub struct FatClosurePtr {
 
 #[repr(C)]
 pub struct RequestRecordHeader {
-    pub closure: FatClosurePtr, // 16
-    pub property_ptr: u64,      // 8
-    pub captured_len: u32,      // env byte count
-    pub args_len: u32,          // serialized args length
-    pub args_offset: u32,       // offset from slot base to start of args bytes
-                                // trailing bytes: [captured_env][serialized_args]
+    pub closure: FatClosurePtr,    // 16
+    pub property_ptr: PropertyPtr, // 8
+    pub captured_len: u32,         // env byte count
+    pub args_len: u32,             // serialized args length
+    pub args_offset: u32,          // offset from slot base to start of args bytes
+                                   // trailing bytes: [captured_env][serialized_args]
+}
+
+#[repr(u64)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum PropertyPtr {
+    CallMutRetUnit = 0,
+    CallMutOutPtr = 1,
+    CallMutArgsOutPtr = 2,
+    IntoInner = 3,
+    Terminate = u64::MAX,
 }
 
 #[repr(C)]
@@ -113,6 +123,8 @@ pub struct ResponseSlot {
 pub struct ChannelPair {
     pub request: UnsafeCell<RequestSlot>,
     pub response: UnsafeCell<ResponseSlot>,
+    // Client-side serialization to enforce SPSC on the request slot across clones.
+    pub client_lock: AtomicBool,
 }
 
 impl Default for SlotHeader {
@@ -164,6 +176,7 @@ impl Default for ChannelPair {
         ChannelPair {
             request: UnsafeCell::new(RequestSlot::default()),
             response: UnsafeCell::new(ResponseSlot::default()),
+            client_lock: AtomicBool::new(false),
         }
     }
 }

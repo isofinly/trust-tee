@@ -1,7 +1,7 @@
 use trust_tee::prelude::*;
 
 fn main() {
-    let counter = Trust::new(Local::entrust(17i64));
+    let counter = Local::entrust(17i64);
 
     // Increment twice synchronously.
     counter.apply(|c| *c += 1);

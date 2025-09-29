@@ -136,45 +136,16 @@ fn bench_contention(c: &mut Criterion) {
             mac_affinity_tag: Some(1),
         };
 
-        let (rt, remote) = Runtime::spawn_with_pin(0i64, 64, Some(pin_t.clone()));
-        let trust = Trust::new(remote);
+        let trust = Remote::entrust_with_pin(0i64, pin_t);
 
         for &batch in batch_sizes {
             let run = Arc::new(AtomicBool::new(true));
 
             let threads: Vec<_> = (0..workers)
-                .map(|i| {
+                .map(|_| {
                     let run = Arc::clone(&run);
-                    let h = rt.entrust();
-                    let trust = Trust::new(h);
-                    #[cfg(target_os = "linux")]
-                    let client_pin: Option<PinConfig> = if i == 0 {
-                        Some(PinConfig {
-                            core_id: Some(1),
-                            numa_node: None,
-                            mem_bind: false,
-                            mac_affinity_tag: None,
-                        })
-                    } else {
-                        None
-                    };
-                    #[cfg(target_os = "macos")]
-                    let client_pin: Option<PinConfig> = if i == 0 {
-                        Some(PinConfig {
-                            core_id: None,
-                            numa_node: None,
-                            mem_bind: false,
-                            mac_affinity_tag: Some(2),
-                        })
-                    } else {
-                        None
-                    };
-
+                    let trust = trust.clone();
                     thread::spawn(move || {
-                        if let Some(cfg) = client_pin {
-                            // Best-effort pin to keep topology predictable.
-                            pin_current_thread(&cfg);
-                        }
                         while run.load(Ordering::Relaxed) {
                             trust.apply_batch_mut(incr_i64, batch as u8);
                             // Yield to let trustee run; avoids perfectly hot spin loops.

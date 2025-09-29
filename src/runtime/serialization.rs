@@ -5,7 +5,7 @@ use std::ptr;
 use std::sync::OnceLock;
 
 use crate::runtime::slots::{
-    Aligned, ErasedVTable, FatClosurePtr, RequestRecordHeader, SLOT_BYTES,
+    Aligned, ErasedVTable, FatClosurePtr, PropertyPtr, RequestRecordHeader, SLOT_BYTES,
 };
 
 impl<Args, Ret> ErasedVTable<Args, Ret> {
@@ -43,7 +43,9 @@ impl<Args, Ret> ErasedVTable<Args, Ret> {
                 // For non-ZST, move F out of slot memory, then call it.
                 unsafe {
                     if size_of::<F>() == 0 {
-                        let f: F = core::mem::MaybeUninit::<F>::uninit().assume_init();
+                        // Construct a ZST without invoking UB or relying on MaybeUninit::assume_init().
+                        // Reading from a dangling, well-aligned non-null pointer to a ZST is valid.
+                        let f: F = core::ptr::read(core::ptr::NonNull::<F>::dangling().as_ptr());
                         f(args)
                     } else {
                         let f_ptr = env.cast::<F>();
@@ -171,12 +173,12 @@ impl SlotWriter {
 /// Example:
 /// ```
 /// use trust_tee::runtime::serialization::{encode_closure, decode_and_call, SlotWriter};
-/// use trust_tee::runtime::slots::{Aligned, SLOT_BYTES};
+/// use trust_tee::runtime::slots::{Aligned, SLOT_BYTES, PropertyPtr};
 ///
 /// let mut storage = Aligned([0u8; SLOT_BYTES]);
 /// let mut out = SlotWriter::new(&mut storage);
 ///
-/// let header = encode_closure::<_, (), String>(&mut out, 0, |()| "ok".to_string(), &[]);
+/// let header = encode_closure::<_, (), String>(&mut out, PropertyPtr::CallMutRetUnit, |()| "ok".to_string(), &[]);
 /// let result: String = unsafe { decode_and_call::<(), String>(&header, ()) };
 ///
 /// assert_eq!(result, "ok");
@@ -187,14 +189,14 @@ impl SlotWriter {
 /// fn item (coerces to Fn/FnMut/FnOnce):
 /// ```
 /// use trust_tee::runtime::serialization::{encode_closure, decode_and_call, SlotWriter};
-/// use trust_tee::runtime::slots::{Aligned, SLOT_BYTES};
+/// use trust_tee::runtime::slots::{Aligned, SLOT_BYTES, PropertyPtr};
 ///
 /// let mut storage = Aligned([0u8; SLOT_BYTES]);
 /// let mut out = SlotWriter::new(&mut storage);
 ///
 /// fn f0(_: ()) -> u32 { 7 }
 ///
-/// let h_fn = encode_closure::<_, (), u32>(&mut out, 0, f0, &[]);
+/// let h_fn = encode_closure::<_, (), u32>(&mut out, PropertyPtr::CallMutRetUnit, f0, &[]);
 /// let r_fn: u32 = unsafe { decode_and_call::<(), u32>(&h_fn, ()) };
 ///
 /// assert_eq!(r_fn, 7);
@@ -203,14 +205,14 @@ impl SlotWriter {
 /// Fn closure (shared/ZST capture):
 /// ```
 /// use trust_tee::runtime::serialization::{encode_closure, decode_and_call, SlotWriter};
-/// use trust_tee::runtime::slots::{Aligned, SLOT_BYTES};
+/// use trust_tee::runtime::slots::{Aligned, SLOT_BYTES, PropertyPtr};
 ///
 /// let mut storage = Aligned([0u8; SLOT_BYTES]);
 /// let mut out = SlotWriter::new(&mut storage);
 ///
 /// let add = |(a, b): (i32, i32)| a + b;
 ///
-/// let h_fn_like = encode_closure::<_, (i32, i32), i32>(&mut out, 0, add, &[]);
+/// let h_fn_like = encode_closure::<_, (i32, i32), i32>(&mut out, PropertyPtr::CallMutRetUnit, add, &[]);
 /// let r_fn_like: i32 = unsafe { decode_and_call::<(i32, i32), i32>(&h_fn_like, (2, 3)) };
 ///
 /// assert_eq!(r_fn_like, 5);
@@ -219,7 +221,7 @@ impl SlotWriter {
 /// FnMut closure (mutates capture), invoked via FnOnce path:
 /// ```
 /// use trust_tee::runtime::serialization::{encode_closure, decode_and_call, SlotWriter};
-/// use trust_tee::runtime::slots::{Aligned, SLOT_BYTES};
+/// use trust_tee::runtime::slots::{Aligned, SLOT_BYTES, PropertyPtr};
 ///
 /// let mut storage = Aligned([0u8; SLOT_BYTES]);
 /// let mut out = SlotWriter::new(&mut storage);
@@ -227,7 +229,7 @@ impl SlotWriter {
 /// let mut acc = 10i32;
 /// let mut c = move |x: i32| { acc += x; acc };
 ///
-/// let h_fnmut = encode_closure::<_, i32, i32>(&mut out, 0, move |x| c(x), &[]);
+/// let h_fnmut = encode_closure::<_, i32, i32>(&mut out, PropertyPtr::CallMutRetUnit, move |x| c(x), &[]);
 /// let r_fnmut: i32 = unsafe { decode_and_call::<i32, i32>(&h_fnmut, 5) };
 ///
 /// assert_eq!(r_fnmut, 15);
@@ -236,21 +238,21 @@ impl SlotWriter {
 /// FnOnce closure (consumes capture):
 /// ```
 /// use trust_tee::runtime::serialization::{encode_closure, decode_and_call, SlotWriter};
-/// use trust_tee::runtime::slots::{Aligned, SLOT_BYTES};
+/// use trust_tee::runtime::slots::{Aligned, SLOT_BYTES, PropertyPtr};
 ///
 /// let mut storage = Aligned([0u8; SLOT_BYTES]);
 /// let mut out = SlotWriter::new(&mut storage);
 ///
 /// let s = String::from("hi");
 ///
-/// let h_fnonce = encode_closure::<_, (), String>(&mut out, 0, move |()| s + "!", &[]);
+/// let h_fnonce = encode_closure::<_, (), String>(&mut out, PropertyPtr::CallMutRetUnit, move |()| s + "!", &[]);
 /// let r_fnonce: String = unsafe { decode_and_call::<(), String>(&h_fnonce, ()) };
 ///
 /// assert_eq!(r_fnonce, "hi!");
 /// ```
 pub fn encode_closure<F, Args: 'static, Ret: 'static>(
     out: &mut SlotWriter,
-    property_ptr: u64,
+    property_ptr: PropertyPtr,
     f: F,
     serialized_args: &[u8],
 ) -> RequestRecordHeader
@@ -281,7 +283,7 @@ where
             call_once_in_place: |env, args| {
                 // For ZST captures construct a fresh instance; otherwise move from slot
                 if size_of::<F>() == 0 {
-                    let f: F = core::mem::MaybeUninit::<F>::uninit().assume_init();
+                    let f: F = core::ptr::read(core::ptr::NonNull::<F>::dangling().as_ptr());
                     f(args)
                 } else {
                     let f_ptr = env.cast::<F>();
@@ -309,7 +311,7 @@ where
 
         // Write F into env (if non-ZST)
         if env_size != 0 {
-            ptr::write((env_ptr_in_slot as *mut u8).cast::<F>(), f);
+            ptr::write(env_ptr_in_slot.cast::<F>(), f);
         }
 
         // 3) Args are written immediately after env; args alignment is 1
@@ -330,7 +332,7 @@ where
             if env_size == 0 {
                 core::ptr::NonNull::<u8>::dangling().as_ptr()
             } else {
-                env_ptr_in_slot as *mut u8
+                env_ptr_in_slot
             },
             args_ptr_in_slot,
             vt_ptr_in_slot as *const (),
@@ -354,7 +356,7 @@ where
 ///
 /// Returns the closure's result.
 ///
-/// Safety:
+/// # Safety
 /// - `hdr` must have been produced by `encode_closure` into still-live, writable
 ///   memory; its env pointer must be valid for a `ptr::read` of type `F` and for
 ///   `drop_in_place` if not executed.
@@ -369,12 +371,12 @@ where
 /// Example:
 /// ```
 /// use trust_tee::runtime::serialization::{encode_closure, decode_and_call, SlotWriter};
-/// use trust_tee::runtime::slots::{Aligned, SLOT_BYTES};
+/// use trust_tee::runtime::slots::{Aligned, SLOT_BYTES, PropertyPtr};
 ///
 /// let mut storage = Aligned([0u8; SLOT_BYTES]);
 /// let mut out = SlotWriter::new(&mut storage);
 ///
-/// let hdr = encode_closure::<_, (u32,), u32>(&mut out, 0, |(x,)| x + 1, &[]);
+/// let hdr = encode_closure::<_, (u32,), u32>(&mut out, PropertyPtr::CallMutRetUnit, |(x,)| x + 1, &[]);
 /// let res: u32 = unsafe { decode_and_call::<(u32,), u32>(&hdr, (41,)) };
 ///
 /// assert_eq!(res, 42);
@@ -383,7 +385,7 @@ where
 /// Deserializing args bytes (before calling):
 /// ```
 /// use trust_tee::runtime::serialization::{encode_closure, decode_and_call, SlotWriter};
-/// use trust_tee::runtime::slots::{Aligned, SLOT_BYTES, RequestRecordHeader};
+/// use trust_tee::runtime::slots::{Aligned, SLOT_BYTES, RequestRecordHeader, PropertyPtr};
 /// let mut storage = Aligned([0u8; SLOT_BYTES]);
 /// let mut out = SlotWriter::new(&mut storage);
 /// // Producer encodes raw arg bytes; here we serialize (u32, u32) as little-endian.
@@ -393,7 +395,7 @@ where
 /// tmp[4..8].copy_from_slice(&args.1.to_le_bytes());
 /// // Remember record start so trustee can locate args relative to slot base.
 /// let record_start = out.cursor;
-/// let hdr = encode_closure::<_, (u32, u32), u32>(&mut out, 0, |(a,b)| a + b, &tmp);
+/// let hdr = encode_closure::<_, (u32, u32), u32>(&mut out, PropertyPtr::CallMutRetUnit, |(a,b)| a + b, &tmp);
 ///
 /// // Trustee computes the args slice using the args_offset from the header.
 /// unsafe {

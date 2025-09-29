@@ -12,7 +12,7 @@ impl<U> Local<Latch<U>> {
     pub fn lock_apply<R>(&self, f: impl FnOnce(&mut U) -> R) -> R {
         let _guard = DelegatedScopeGuard::enter();
         // Safety: local trustee shortcut; serialized by contract.
-        let latch = unsafe { &mut *self.inner.get() };
+        let latch = unsafe { &mut *self.inner.inner.get() };
         let mut g = latch.lock();
         f(&mut *g)
     }
@@ -28,7 +28,7 @@ impl<U> Local<Latch<U>> {
     #[inline]
     pub fn lock_apply_with<V, R>(&self, f: impl FnOnce(&mut U, V) -> R, w: V) -> R {
         let _guard = DelegatedScopeGuard::enter();
-        let latch = unsafe { &mut *self.inner.get() };
+        let latch = unsafe { &mut *self.inner.inner.get() };
         let mut g = latch.lock();
         f(&mut *g, w)
     }
@@ -37,7 +37,7 @@ impl<U> Local<Latch<U>> {
     #[inline]
     pub fn lock_with<R>(&self, f: impl FnOnce(&U) -> R) -> R {
         let _guard = DelegatedScopeGuard::enter();
-        let latch = unsafe { &mut *self.inner.get() };
+        let latch = unsafe { &mut *self.inner.inner.get() };
         let g = latch.lock();
         f(&*g)
     }

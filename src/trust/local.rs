@@ -1,3 +1,4 @@
+use crate::trust::common::TrustLike;
 use crate::util::fiber::DelegatedScopeGuard;
 use core::cell::UnsafeCell;
 
@@ -73,5 +74,25 @@ impl<T> super::common::TrustLike for Local<T> {
                 f(&mut *ptr);
             }
         }
+    }
+
+    #[inline]
+    /// Get underlying value and drop the trust instance.
+    fn into_inner(self) -> T {
+        self.inner.into_inner()
+    }
+}
+
+impl<T: core::fmt::Display> core::fmt::Display for Local<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = self.with(|v| format!("{}", v));
+        f.write_str(&s)
+    }
+}
+
+impl<T: core::fmt::Debug> core::fmt::Debug for Local<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = self.with(|v| format!("{:?}", v));
+        f.debug_tuple("Local").field(&s).finish()
     }
 }

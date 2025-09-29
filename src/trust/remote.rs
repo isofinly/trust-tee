@@ -1,6 +1,9 @@
 use crate::runtime::Runtime;
 use crate::runtime::serialization::{SlotWriter, encode_closure};
-use crate::runtime::slots::{ChannelPair, HEADER_BYTES, RequestRecordHeader, SLOT_BYTES, header};
+use crate::runtime::slots::{
+    ChannelPair, ErasedVTable, HEADER_BYTES, PropertyPtr, RequestRecordHeader, SLOT_BYTES, header,
+};
+use crate::trust::common::TrustLike;
 use crate::util::WaitBudget;
 use bincode;
 use core::cell::Cell;
@@ -43,6 +46,28 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
         R: Send + 'static,
     {
         unsafe {
+            // Acquire client-side lock to serialize access to request slot across clones.
+            while self
+                .chan
+                .client_lock
+                .compare_exchange(
+                    false,
+                    true,
+                    core::sync::atomic::Ordering::Acquire,
+                    core::sync::atomic::Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                core::hint::spin_loop();
+            }
+            // Ensure lock is released on all paths.
+            struct Guard<'a>(&'a core::sync::atomic::AtomicBool);
+            impl<'a> Drop for Guard<'a> {
+                fn drop(&mut self) {
+                    self.0.store(false, core::sync::atomic::Ordering::Release);
+                }
+            }
+            let _guard = Guard(&self.chan.client_lock);
             let base = self.chan.request.get() as *mut u8;
             let mut w = SlotWriter {
                 base,
@@ -52,7 +77,7 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
             // Encode closure that writes its return value into response slot.
             let hdr = encode_closure::<_, (&mut T, *mut u8), ()>(
                 &mut w,
-                2,
+                PropertyPtr::CallMutOutPtr,
                 move |(p, out)| {
                     let r = f(p);
                     core::ptr::write_unaligned(out as *mut R, r);
@@ -107,6 +132,26 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
         R: Send + 'static,
     {
         unsafe {
+            while self
+                .chan
+                .client_lock
+                .compare_exchange(
+                    false,
+                    true,
+                    core::sync::atomic::Ordering::Acquire,
+                    core::sync::atomic::Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                core::hint::spin_loop();
+            }
+            struct Guard<'a>(&'a core::sync::atomic::AtomicBool);
+            impl<'a> Drop for Guard<'a> {
+                fn drop(&mut self) {
+                    self.0.store(false, core::sync::atomic::Ordering::Release);
+                }
+            }
+            let _guard = Guard(&self.chan.client_lock);
             let base = self.chan.request.get() as *mut u8;
             let mut wtr = SlotWriter {
                 base,
@@ -117,7 +162,7 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
             let args = bincode::serialize(&w).expect("bincode serialize");
             let hdr = encode_closure::<_, (&mut T, *mut u8, *const u8, u32), ()>(
                 &mut wtr,
-                3,
+                PropertyPtr::CallMutArgsOutPtr,
                 move |(p, out, bytes, len)| {
                     let slice = { core::slice::from_raw_parts(bytes, len as usize) };
                     let v: V = bincode::deserialize(slice).expect("bincode deserialize");
@@ -159,6 +204,26 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
         R: Send + 'static,
     {
         unsafe {
+            while self
+                .chan
+                .client_lock
+                .compare_exchange(
+                    false,
+                    true,
+                    core::sync::atomic::Ordering::Acquire,
+                    core::sync::atomic::Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                core::hint::spin_loop();
+            }
+            struct Guard<'a>(&'a core::sync::atomic::AtomicBool);
+            impl<'a> Drop for Guard<'a> {
+                fn drop(&mut self) {
+                    self.0.store(false, core::sync::atomic::Ordering::Release);
+                }
+            }
+            let _guard = Guard(&self.chan.client_lock);
             let base = self.chan.request.get() as *mut u8;
             let mut w = SlotWriter {
                 base,
@@ -168,7 +233,7 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
             // Invoke f with &T view and write result into response
             let hdr = encode_closure::<_, (&mut T, *mut u8), ()>(
                 &mut w,
-                2,
+                PropertyPtr::CallMutOutPtr,
                 move |(p, out)| {
                     let r = f(&*p as &T);
                     core::ptr::write_unaligned(out as *mut R, r);
@@ -205,12 +270,35 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
     fn apply_batch_mut(&self, f: fn(&mut T), n: u8) {
         // Delegate to the existing apply_batch_mut implementation
         unsafe {
+            while self
+                .chan
+                .client_lock
+                .compare_exchange(
+                    false,
+                    true,
+                    core::sync::atomic::Ordering::Acquire,
+                    core::sync::atomic::Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                core::hint::spin_loop();
+            }
+            struct Guard<'a>(&'a core::sync::atomic::AtomicBool);
+            impl<'a> Drop for Guard<'a> {
+                fn drop(&mut self) {
+                    self.0.store(false, core::sync::atomic::Ordering::Release);
+                }
+            }
+            let _guard = Guard(&self.chan.client_lock);
             let base = self.chan.request.get() as *mut u8;
             let hdr_size = core::mem::size_of::<RequestRecordHeader>();
             let mut remaining = n;
 
             while remaining > 0 {
-                // Compute closure env size/alignment: closure captures only `f: fn(&mut T)`
+                // Compute per-record layout sizes/alignments as done by encode_closure
+                // Each record writes: [ErasedVTable<(&mut T,), ()>] then env for `F` capturing `f`
+                let vt_size = core::mem::size_of::<ErasedVTable<(&mut T,), ()>>();
+                let vt_align = core::mem::align_of::<ErasedVTable<(&mut T,), ()>>();
                 let env_size = core::mem::size_of::<fn(&mut T)>();
                 let env_align = core::mem::align_of::<fn(&mut T)>();
 
@@ -219,19 +307,31 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
                 let mut best = 0usize;
                 let try_up_to = core::cmp::min(remaining as usize, cap_by_headers);
                 for k in 1..=try_up_to {
-                    // Payload starts after k headers
+                    // Start cursor after the header table for k records
                     let mut cursor = HEADER_BYTES + k * hdr_size;
-                    // Pack k envs back-to-back with alignment
+                    // Simulate encode_closure() layout k times: align+write VT, align+write ENV, no args
                     for _ in 0..k {
-                        let align_mask = env_align.saturating_sub(1);
-                        if align_mask != 0 {
-                            let rem = cursor & align_mask;
+                        // align for VT
+                        let mask_vt = vt_align.saturating_sub(1);
+                        if mask_vt != 0 {
+                            let rem = cursor & mask_vt;
+                            if rem != 0 {
+                                cursor += vt_align - rem;
+                            }
+                        }
+                        cursor += vt_size;
+
+                        // align for ENV
+                        let mask_env = env_align.saturating_sub(1);
+                        if mask_env != 0 {
+                            let rem = cursor & mask_env;
                             if rem != 0 {
                                 cursor += env_align - rem;
                             }
                         }
-                        cursor += env_size;
+                        cursor += env_size; // args_len == 0 for this path
                     }
+
                     if cursor - HEADER_BYTES <= available {
                         best = k;
                     } else {
@@ -249,8 +349,12 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
 
                 // Encode each record's capture/env immediately after the header table.
                 for i in 0..batch {
-                    let hdr =
-                        encode_closure::<_, (&mut T,), ()>(&mut w, 0, move |(p,)| (f)(p), &[]);
+                    let hdr = encode_closure::<_, (&mut T,), ()>(
+                        &mut w,
+                        PropertyPtr::CallMutRetUnit,
+                        move |(p,)| (f)(p),
+                        &[],
+                    );
                     let hdr_ptr = base.add(HEADER_BYTES + (i as usize) * hdr_size)
                         as *mut RequestRecordHeader;
                     core::ptr::write_unaligned(hdr_ptr, hdr);
@@ -286,6 +390,97 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
 
                 remaining -= batch;
             }
+        }
+    }
+
+    #[inline]
+    /// Get underlying value and drop the trust instance.
+    fn into_inner(self) -> T {
+        // Only valid when this remote owns the runtime worker
+        assert!(
+            self._owner.is_some(),
+            "Remote::into_inner requires owned runtime"
+        );
+        unsafe {
+            while self
+                .chan
+                .client_lock
+                .compare_exchange(
+                    false,
+                    true,
+                    core::sync::atomic::Ordering::Acquire,
+                    core::sync::atomic::Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                core::hint::spin_loop();
+            }
+            struct Guard<'a>(&'a core::sync::atomic::AtomicBool);
+            impl<'a> Drop for Guard<'a> {
+                fn drop(&mut self) {
+                    self.0.store(false, core::sync::atomic::Ordering::Release);
+                }
+            }
+            let _guard = Guard(&self.chan.client_lock);
+            let base = self.chan.request.get() as *mut u8;
+            let mut w = SlotWriter {
+                base,
+                len: SLOT_BYTES,
+                cursor: HEADER_BYTES + core::mem::size_of::<RequestRecordHeader>(),
+            };
+            // property_ptr=4 instructs the worker to move out T into the response and terminate.
+            let hdr =
+                encode_closure::<_, (&mut T,), ()>(&mut w, PropertyPtr::IntoInner, |_p| (), &[]);
+            let hdr_ptr = base.add(HEADER_BYTES) as *mut RequestRecordHeader;
+            core::ptr::write_unaligned(hdr_ptr, hdr);
+
+            // Signal request ready with count=1
+            let resp_flags = self.chan.response.get() as *const core::sync::atomic::AtomicU32;
+            let req_flags = self.chan.request.get() as *const core::sync::atomic::AtomicU32;
+            let resp_word = (*resp_flags).load(core::sync::atomic::Ordering::Acquire);
+            let req_ready = !header::ready(resp_word);
+            let word = header::pack_ready_count(req_ready, 1);
+            (*req_flags).store(word, core::sync::atomic::Ordering::Release);
+
+            // Wait for response
+            let mut budget = WaitBudget::hot();
+            loop {
+                let resp_word_now = (*resp_flags).load(core::sync::atomic::Ordering::Acquire);
+                if header::ready(resp_word_now) == req_ready {
+                    break;
+                }
+                budget.step();
+            }
+
+            // Read moved-out T
+            let resp_base = self.chan.response.get() as *const u8;
+            let resp_data = resp_base.add(HEADER_BYTES);
+            core::ptr::read_unaligned(resp_data.cast::<T>())
+        }
+    }
+}
+
+impl<T: Send + 'static + core::fmt::Display> core::fmt::Display for Remote<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = self.with(|v| format!("{}", v));
+        f.write_str(&s)
+    }
+}
+
+impl<T: Send + 'static + core::fmt::Debug> core::fmt::Debug for Remote<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = self.with(|v| format!("{:?}", v));
+        f.debug_tuple("Remote").field(&s).finish()
+    }
+}
+
+impl<T: Send + 'static> Clone for Remote<T> {
+    fn clone(&self) -> Self {
+        Self {
+            chan: self.chan.clone(), // Arc::clone
+            _phantom: PhantomData,
+            _owner: None, // Cloned handles don't own the runtime
+            _not_sync: PhantomData,
         }
     }
 }
