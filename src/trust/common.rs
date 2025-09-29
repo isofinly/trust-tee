@@ -138,6 +138,7 @@ impl<T: Send + 'static> Trust<super::remote::Remote<T>> {
         Self {
             inner: super::remote::Remote {
                 chan: handle.chan.clone(),
+                registrar: handle.registrar.clone(),
                 _phantom: core::marker::PhantomData,
                 _owner: Some(rt),
                 _not_sync: core::marker::PhantomData,

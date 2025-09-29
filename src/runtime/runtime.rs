@@ -16,6 +16,65 @@ use crate::{
     util::affinity::{PinConfig, pin_current_thread},
 };
 
+// Concrete, zero-overhead registrar to register new ChannelPairs with the worker.
+#[cfg(not(miri))]
+pub(crate) struct Registrar<T> {
+    reg: Arc<mpsc::Queue<ClientPair<T>>>,
+}
+
+#[cfg(miri)]
+pub(crate) struct Registrar<T> {
+    reg_tx: Sender<ClientPair<T>>,
+}
+
+#[cfg(not(miri))]
+impl<T> Registrar<T> {
+    #[inline]
+    fn new(reg: Arc<mpsc::Queue<ClientPair<T>>>) -> Self {
+        Self { reg }
+    }
+    #[inline]
+    pub(crate) fn register(&self, chan: Arc<ChannelPair>) {
+        self.reg.push(ClientPair {
+            chan,
+            _phantom: PhantomData,
+        });
+    }
+}
+
+#[cfg(miri)]
+impl<T> Registrar<T> {
+    #[inline]
+    fn new(reg_tx: Sender<ClientPair<T>>) -> Self {
+        Self { reg_tx }
+    }
+    #[inline]
+    pub(crate) fn register(&self, chan: Arc<ChannelPair>) {
+        let _ = self.reg_tx.send(ClientPair {
+            chan,
+            _phantom: PhantomData,
+        });
+    }
+}
+
+#[cfg(not(miri))]
+impl<T> Clone for Registrar<T> {
+    fn clone(&self) -> Self {
+        Self {
+            reg: self.reg.clone(),
+        }
+    }
+}
+
+#[cfg(miri)]
+impl<T> Clone for Registrar<T> {
+    fn clone(&self) -> Self {
+        Self {
+            reg_tx: self.reg_tx.clone(),
+        }
+    }
+}
+
 struct ClientPair<T> {
     chan: Arc<ChannelPair>,
     _phantom: PhantomData<T>,
@@ -239,8 +298,13 @@ impl<T: Send + 'static> Runtime<T> {
                 _phantom: PhantomData,
             });
         }
+        #[cfg(not(miri))]
+        let registrar = Registrar::new(self.reg.clone());
+        #[cfg(miri)]
+        let registrar = Registrar::new(self.reg_tx.clone());
         Remote {
             chan,
+            registrar,
             _phantom: PhantomData,
             _owner: None,
             _not_sync: core::marker::PhantomData,

@@ -1,4 +1,5 @@
 use crate::runtime::Runtime;
+use crate::runtime::runtime::Registrar;
 use crate::runtime::serialization::{SlotWriter, encode_closure};
 use crate::runtime::slots::{
     ChannelPair, ErasedVTable, HEADER_BYTES, PropertyPtr, RequestRecordHeader, SLOT_BYTES, header,
@@ -13,6 +14,8 @@ use std::sync::Arc;
 /// Client Remote Trust to submit operations to a `Runtime<T>` and await replies.
 pub struct Remote<T> {
     pub(crate) chan: Arc<ChannelPair>,
+    // Registrar registers a new ChannelPair with the worker thread
+    pub(crate) registrar: Registrar<T>,
     pub(crate) _phantom: PhantomData<T>,
     // When created via Remote::entrust(), keep the runtime alive until this handle drops.
     pub(crate) _owner: Option<Runtime<T>>,
@@ -32,6 +35,7 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
         let (rt, handle) = Runtime::spawn(value);
         Self {
             chan: handle.chan.clone(),
+            registrar: handle.registrar.clone(),
             _phantom: PhantomData,
             _owner: Some(rt),
             _not_sync: PhantomData,
@@ -46,23 +50,6 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
         R: Send + 'static,
     {
         unsafe {
-            // Acquire client-side lock to serialize access to request slot across clones.
-            WaitBudget::acquire_lock_with_budget(|| {
-                self.chan.client_lock.compare_exchange(
-                    false,
-                    true,
-                    core::sync::atomic::Ordering::Acquire,
-                    core::sync::atomic::Ordering::Relaxed,
-                )
-            });
-            // Ensure lock is released on all paths.
-            struct Guard<'a>(&'a core::sync::atomic::AtomicBool);
-            impl<'a> Drop for Guard<'a> {
-                fn drop(&mut self) {
-                    self.0.store(false, core::sync::atomic::Ordering::Release);
-                }
-            }
-            let _guard = Guard(&self.chan.client_lock);
             let base = self.chan.request.get() as *mut u8;
             let mut w = SlotWriter {
                 base,
@@ -127,21 +114,6 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
         R: Send + 'static,
     {
         unsafe {
-            WaitBudget::acquire_lock_with_budget(|| {
-                self.chan.client_lock.compare_exchange(
-                    false,
-                    true,
-                    core::sync::atomic::Ordering::Acquire,
-                    core::sync::atomic::Ordering::Relaxed,
-                )
-            });
-            struct Guard<'a>(&'a core::sync::atomic::AtomicBool);
-            impl<'a> Drop for Guard<'a> {
-                fn drop(&mut self) {
-                    self.0.store(false, core::sync::atomic::Ordering::Release);
-                }
-            }
-            let _guard = Guard(&self.chan.client_lock);
             let base = self.chan.request.get() as *mut u8;
             let mut wtr = SlotWriter {
                 base,
@@ -194,21 +166,6 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
         R: Send + 'static,
     {
         unsafe {
-            WaitBudget::acquire_lock_with_budget(|| {
-                self.chan.client_lock.compare_exchange(
-                    false,
-                    true,
-                    core::sync::atomic::Ordering::Acquire,
-                    core::sync::atomic::Ordering::Relaxed,
-                )
-            });
-            struct Guard<'a>(&'a core::sync::atomic::AtomicBool);
-            impl<'a> Drop for Guard<'a> {
-                fn drop(&mut self) {
-                    self.0.store(false, core::sync::atomic::Ordering::Release);
-                }
-            }
-            let _guard = Guard(&self.chan.client_lock);
             let base = self.chan.request.get() as *mut u8;
             let mut w = SlotWriter {
                 base,
@@ -255,21 +212,6 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
     fn apply_batch_mut(&self, f: fn(&mut T), n: u8) {
         // Delegate to the existing apply_batch_mut implementation
         unsafe {
-            WaitBudget::acquire_lock_with_budget(|| {
-                self.chan.client_lock.compare_exchange(
-                    false,
-                    true,
-                    core::sync::atomic::Ordering::Acquire,
-                    core::sync::atomic::Ordering::Relaxed,
-                )
-            });
-            struct Guard<'a>(&'a core::sync::atomic::AtomicBool);
-            impl<'a> Drop for Guard<'a> {
-                fn drop(&mut self) {
-                    self.0.store(false, core::sync::atomic::Ordering::Release);
-                }
-            }
-            let _guard = Guard(&self.chan.client_lock);
             let base = self.chan.request.get() as *mut u8;
             let hdr_size = core::mem::size_of::<RequestRecordHeader>();
             let mut remaining = n;
@@ -382,21 +324,6 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
             "Remote::into_inner requires owned runtime"
         );
         unsafe {
-            WaitBudget::acquire_lock_with_budget(|| {
-                self.chan.client_lock.compare_exchange(
-                    false,
-                    true,
-                    core::sync::atomic::Ordering::Acquire,
-                    core::sync::atomic::Ordering::Relaxed,
-                )
-            });
-            struct Guard<'a>(&'a core::sync::atomic::AtomicBool);
-            impl<'a> Drop for Guard<'a> {
-                fn drop(&mut self) {
-                    self.0.store(false, core::sync::atomic::Ordering::Release);
-                }
-            }
-            let _guard = Guard(&self.chan.client_lock);
             let base = self.chan.request.get() as *mut u8;
             let mut w = SlotWriter {
                 base,
@@ -451,10 +378,14 @@ impl<T: Send + 'static + core::fmt::Debug> core::fmt::Debug for Remote<T> {
 
 impl<T: Send + 'static> Clone for Remote<T> {
     fn clone(&self) -> Self {
+        // allocate a fresh ChannelPair for this clone and register it with worker
+        let chan = Arc::new(ChannelPair::default());
+        self.registrar.register(chan.clone());
         Self {
-            chan: self.chan.clone(), // Arc::clone
+            chan,
+            registrar: self.registrar.clone(),
             _phantom: PhantomData,
-            _owner: None, // Cloned handles don't own the runtime
+            _owner: None,
             _not_sync: PhantomData,
         }
     }

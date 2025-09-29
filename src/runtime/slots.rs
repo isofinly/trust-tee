@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 #![allow(missing_docs)]
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU32};
+use core::sync::atomic::AtomicU32;
 
 #[repr(align(64))]
 pub struct Aligned<const N: usize>(pub [u8; N]);
@@ -122,8 +122,6 @@ pub struct ResponseSlot {
 pub struct ChannelPair {
     pub request: UnsafeCell<RequestSlot>,
     pub response: UnsafeCell<ResponseSlot>,
-    // Client-side serialization to enforce SPSC on the request slot across clones.
-    pub client_lock: AtomicBool,
 }
 
 impl Default for SlotHeader {
@@ -175,7 +173,6 @@ impl Default for ChannelPair {
         ChannelPair {
             request: UnsafeCell::new(RequestSlot::default()),
             response: UnsafeCell::new(ResponseSlot::default()),
-            client_lock: AtomicBool::new(false),
         }
     }
 }
