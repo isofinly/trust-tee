@@ -683,6 +683,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "criterion",
+ "crossbeam-queue",
  "libc",
  "may",
  "num_cpus",

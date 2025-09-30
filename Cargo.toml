@@ -16,6 +16,7 @@ libc = "0.2"
 sptr = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 bincode = { version = "1.0.1" }
+crossbeam-queue = "0.3.12"
 
 [features]
 default = []

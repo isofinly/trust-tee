@@ -1,9 +1,6 @@
 use core::marker::PhantomData;
-#[cfg(not(miri))]
-use may::queue::mpsc;
+use crossbeam_queue::SegQueue;
 use smallvec::SmallVec;
-#[cfg(miri)]
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::{sync::Arc, thread};
 
 use crate::{
@@ -17,20 +14,13 @@ use crate::{
 };
 
 // Concrete, zero-overhead registrar to register new ChannelPairs with the worker.
-#[cfg(not(miri))]
 pub(crate) struct Registrar<T> {
-    reg: Arc<mpsc::Queue<ClientPair<T>>>,
+    reg: Arc<SegQueue<ClientPair<T>>>,
 }
 
-#[cfg(miri)]
-pub(crate) struct Registrar<T> {
-    reg_tx: Sender<ClientPair<T>>,
-}
-
-#[cfg(not(miri))]
 impl<T> Registrar<T> {
     #[inline]
-    fn new(reg: Arc<mpsc::Queue<ClientPair<T>>>) -> Self {
+    fn new(reg: Arc<SegQueue<ClientPair<T>>>) -> Self {
         Self { reg }
     }
     #[inline]
@@ -42,35 +32,10 @@ impl<T> Registrar<T> {
     }
 }
 
-#[cfg(miri)]
-impl<T> Registrar<T> {
-    #[inline]
-    fn new(reg_tx: Sender<ClientPair<T>>) -> Self {
-        Self { reg_tx }
-    }
-    #[inline]
-    pub(crate) fn register(&self, chan: Arc<ChannelPair>) {
-        let _ = self.reg_tx.send(ClientPair {
-            chan,
-            _phantom: PhantomData,
-        });
-    }
-}
-
-#[cfg(not(miri))]
 impl<T> Clone for Registrar<T> {
     fn clone(&self) -> Self {
         Self {
             reg: self.reg.clone(),
-        }
-    }
-}
-
-#[cfg(miri)]
-impl<T> Clone for Registrar<T> {
-    fn clone(&self) -> Self {
-        Self {
-            reg_tx: self.reg_tx.clone(),
         }
     }
 }
@@ -82,20 +47,14 @@ struct ClientPair<T> {
 
 /// Runtime hosting a property `T` on a worker thread and serving clients.
 pub struct Runtime<T> {
-    #[cfg(not(miri))]
-    reg: Arc<mpsc::Queue<ClientPair<T>>>,
-    #[cfg(miri)]
-    reg_tx: Sender<ClientPair<T>>,
+    reg: Arc<SegQueue<ClientPair<T>>>,
     _worker: Option<thread::JoinHandle<()>>,
 }
 
 impl<T> Clone for Runtime<T> {
     fn clone(&self) -> Self {
         Runtime {
-            #[cfg(not(miri))]
             reg: self.reg.clone(),
-            #[cfg(miri)]
-            reg_tx: self.reg_tx.clone(),
             _worker: None,
         }
     }
@@ -109,13 +68,8 @@ impl<T: Send + 'static> Runtime<T> {
 
     /// Spawn a remote runtime worker with explicit `burst` and optional pinning.
     pub fn spawn_with_pin(value: T, _burst: usize, pin: Option<PinConfig>) -> (Self, Remote<T>) {
-        #[cfg(not(miri))]
-        let reg: Arc<mpsc::Queue<ClientPair<T>>> = Arc::new(mpsc::Queue::new());
-        #[cfg(not(miri))]
+        let reg: Arc<SegQueue<ClientPair<T>>> = Arc::new(SegQueue::new());
         let reg_consumer = reg.clone();
-
-        #[cfg(miri)]
-        let (reg_tx, reg_rx): (Sender<ClientPair<T>>, Receiver<ClientPair<T>>) = channel();
 
         let _worker = thread::spawn(move || {
             if let Some(cfg) = pin {
@@ -130,7 +84,6 @@ impl<T: Send + 'static> Runtime<T> {
                 // Drain registrations in bounded chunks.
                 let mut drained = 0;
                 while drained < 256 {
-                    #[cfg(not(miri))]
                     {
                         match reg_consumer.pop() {
                             Some(cp) => {
@@ -138,17 +91,6 @@ impl<T: Send + 'static> Runtime<T> {
                                 drained += 1;
                             }
                             None => break,
-                        }
-                    }
-                    #[cfg(miri)]
-                    {
-                        match reg_rx.try_recv() {
-                            Ok(cp) => {
-                                clients.push(cp);
-                                drained += 1;
-                            }
-                            Err(TryRecvError::Empty) => break,
-                            Err(TryRecvError::Disconnected) => break,
                         }
                     }
                 }
@@ -272,10 +214,7 @@ impl<T: Send + 'static> Runtime<T> {
         });
 
         let rt = Runtime {
-            #[cfg(not(miri))]
             reg,
-            #[cfg(miri)]
-            reg_tx,
             _worker: Some(_worker),
         };
         let handle = rt.entrust();
@@ -286,22 +225,12 @@ impl<T: Send + 'static> Runtime<T> {
     /// Create a client handle by registering a channel pair with the worker.
     pub fn entrust(&self) -> Remote<T> {
         let chan = Arc::new(ChannelPair::default());
-        #[cfg(not(miri))]
         self.reg.push(ClientPair {
             chan: chan.clone(),
             _phantom: PhantomData,
         });
-        #[cfg(miri)]
-        {
-            let _ = self.reg_tx.send(ClientPair {
-                chan: chan.clone(),
-                _phantom: PhantomData,
-            });
-        }
-        #[cfg(not(miri))]
+
         let registrar = Registrar::new(self.reg.clone());
-        #[cfg(miri)]
-        let registrar = Registrar::new(self.reg_tx.clone());
         Remote {
             chan,
             registrar,
@@ -317,18 +246,10 @@ impl<T> Drop for Runtime<T> {
         if let Some(handle) = self._worker.take() {
             // Send TERM to worker via a temporary registration
             let chan = Arc::new(ChannelPair::default());
-            #[cfg(not(miri))]
             self.reg.push(ClientPair {
                 chan: chan.clone(),
                 _phantom: PhantomData,
             });
-            #[cfg(miri)]
-            {
-                let _ = self.reg_tx.send(ClientPair {
-                    chan: chan.clone(),
-                    _phantom: PhantomData,
-                });
-            }
             unsafe {
                 let base = chan.request.get() as *mut u8;
                 let hdr_ptr = base.add(HEADER_BYTES) as *mut RequestRecordHeader;
