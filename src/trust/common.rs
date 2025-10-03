@@ -5,19 +5,23 @@ pub trait TrustLike {
 
     /// Create a new trust instance holding `value`.
     fn entrust(value: Self::Value) -> Self;
+
     /// Get underlying value and drop the trust instance.
     fn into_inner(self) -> Self::Value;
+
     /// Mutably apply `f` to the inner value and return its result.
     /// Only pure values may cross the channel; `F` must be `Send + 'static`.
     fn apply<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut Self::Value) -> R + Send + 'static,
         R: Send + 'static;
+
     /// Apply `f`, then enqueue `then` to run with the result.
     fn apply_then<F, R>(&self, f: F, then: impl FnOnce(R))
     where
         F: FnOnce(&mut Self::Value) -> R + Send + 'static,
         R: Send + 'static;
+
     /// Mutably apply `f` with a pure value `w` serialized over the channel.
     /// `V` must be serde-serializable and -deserializable; no references or pointers may cross.
     fn apply_with<F, V, R>(&self, f: F, w: V) -> R
@@ -25,11 +29,13 @@ pub trait TrustLike {
         F: FnOnce(&mut Self::Value, V) -> R + Send + 'static,
         V: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
         R: Send + 'static;
+
     /// Borrow the inner value immutably to compute `R`.
     fn with<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&Self::Value) -> R + Send + 'static,
         R: Send + 'static;
+
     /// Apply a mutation `n` times on the inner value and wait for completion.
     fn apply_batch_mut(&self, f: fn(&mut Self::Value), n: u8);
 }
