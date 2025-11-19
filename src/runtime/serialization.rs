@@ -8,61 +8,43 @@ use crate::runtime::slots::{
     Aligned, ErasedVTable, FatClosurePtr, PropertyPtr, RequestRecordHeader, SLOT_BYTES,
 };
 
-impl<Args, Ret> ErasedVTable<Args, Ret> {
-    /// Returns the monomorphized erased vtable for a specific closure type `F`.
-    ///
-    /// - One singleton is created per `{Args, Ret, F}` instantiation.
-    /// - The vtable provides `call_once_in_place` (move `F` out of the slot and run)
-    ///   and `drop_in_place` (drop the captured `F` in the slot without calling it).
-    /// - For zero-sized `F`, calling does not read from memory and constructs a fresh ZST.
-    ///
-    /// Strict provenance: `env` given to vtable functions must be derived from the
-    /// original allocation (e.g., slot buffer) using in-bounds pointer arithmetic.
-    ///
-    /// Type parameters:
-    /// - `Args`: argument tuple the closure accepts.
-    /// - `Ret`: return type of the closure.
-    /// - `F`: concrete closure type implementing `FnOnce(Args) -> Ret + Send + 'static`.
-    pub fn for_closure<F>() -> &'static Self
-    where
-        F: FnOnce(Args) -> Ret + Send + 'static,
-    {
-        #[allow(non_camel_case_types)]
-        struct PER_F<Args, Ret, F>(core::marker::PhantomData<(Args, Ret, F)>);
-        impl<Args, Ret, F> PER_F<Args, Ret, F> {
-            fn cell() -> &'static OnceLock<ErasedVTable<Args, Ret>> {
-                static CELL: OnceLock<ErasedVTable<(), ()>> = OnceLock::new();
-                // SAFETY: Each monomorphization gets a distinct CELL.
-                unsafe { &*(&CELL as *const _ as *const OnceLock<ErasedVTable<Args, Ret>>) }
-            }
-        }
+struct VTableGen<F, Args, Ret>(core::marker::PhantomData<(F, Args, Ret)>);
 
-        PER_F::<Args, Ret, F>::cell().get_or_init(|| ErasedVTable {
-            call_once_in_place: |env, args| {
-                // For ZST captures there is no stored instance; construct a fresh ZST.
-                // For non-ZST, move F out of slot memory, then call it.
-                unsafe {
-                    if size_of::<F>() == 0 {
-                        // Construct a ZST without invoking UB or relying on MaybeUninit::assume_init().
-                        // Reading from a dangling, well-aligned non-null pointer to a ZST is valid.
-                        let f: F = core::ptr::read(core::ptr::NonNull::<F>::dangling().as_ptr());
-                        f(args)
-                    } else {
-                        let f_ptr = env.cast::<F>();
-                        let f: F = ptr::read(f_ptr); // move, not copy
-                        f(args)
-                        // f is dropped here; any captured resources are released.
-                    }
-                }
-            },
-            drop_in_place: |env| unsafe {
-                if size_of::<F>() != 0 {
-                    ptr::drop_in_place::<F>(env.cast::<F>());
-                }
-            },
-            env_align: align_of::<F>() as u32,
-            env_size: size_of::<F>() as u32,
-        })
+impl<F, Args, Ret> VTableGen<F, Args, Ret>
+where
+    F: FnOnce(Args) -> Ret + Send + 'static,
+{
+    const VTABLE: ErasedVTable<Args, Ret> = ErasedVTable {
+        call_once_in_place: call_once_shim::<F, Args, Ret>,
+        drop_in_place: drop_shim::<F>,
+        env_align: align_of::<F>() as u32,
+        env_size: size_of::<F>() as u32,
+    };
+}
+
+#[inline(always)]
+unsafe fn call_once_shim<F, Args, Ret>(env: *mut u8, args: Args) -> Ret
+where
+    F: FnOnce(Args) -> Ret + Send + 'static,
+{
+    unsafe {
+        if size_of::<F>() == 0 {
+            let f: F = core::ptr::read(core::ptr::NonNull::<F>::dangling().as_ptr());
+            f(args)
+        } else {
+            let f_ptr = env.cast::<F>();
+            let f: F = ptr::read(f_ptr);
+            f(args)
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn drop_shim<F>(env: *mut u8) {
+    unsafe {
+        if size_of::<F>() != 0 {
+            ptr::drop_in_place::<F>(env.cast::<F>());
+        }
     }
 }
 
@@ -116,6 +98,7 @@ impl SlotWriter {
     /// - `align`: required alignment (power-of-two). Alignment of 0 is treated as 1.
     ///
     /// Returns: a `*mut u8` pointing to the start of the reserved region.
+    #[inline]
     pub fn alloc_aligned(&mut self, size: usize, align: usize) -> *mut u8 {
         let pos = crate::runtime::slots::header::next_boundary_offset(self.cursor, size, align);
         self.cursor = pos + size;
@@ -259,36 +242,10 @@ where
     let env_size = size_of::<F>();
     let env_align = align_of::<F>();
 
-    // Build vtable locally and place it inside the slot for this record.
+    // Use static VTable instead of writing it to the slot.
     let (env_ptr, args_ptr_in_slot, vt_ptr_any) = unsafe {
-        // 1) Allocate space for vtable
-        let vt_ptr_in_slot = out.alloc_aligned(
-            size_of::<ErasedVTable<Args, Ret>>(),
-            align_of::<ErasedVTable<Args, Ret>>(),
-        ) as *mut ErasedVTable<Args, Ret>;
-
-        // Initialize vtable for F
-        let vt_value = ErasedVTable::<Args, Ret> {
-            call_once_in_place: |env, args| {
-                // For ZST captures construct a fresh instance; otherwise move from slot
-                if size_of::<F>() == 0 {
-                    let f: F = core::ptr::read(core::ptr::NonNull::<F>::dangling().as_ptr());
-                    f(args)
-                } else {
-                    let f_ptr = env.cast::<F>();
-                    let f: F = ptr::read(f_ptr);
-                    f(args)
-                }
-            },
-            drop_in_place: |env| {
-                if size_of::<F>() != 0 {
-                    ptr::drop_in_place::<F>(env.cast::<F>());
-                }
-            },
-            env_align: env_align as u32,
-            env_size: env_size as u32,
-        };
-        ptr::write(vt_ptr_in_slot, vt_value);
+        // 1) Get static VTable pointer
+        let vt_ptr = &VTableGen::<F, Args, Ret>::VTABLE as *const ErasedVTable<Args, Ret>;
 
         // 2) Allocate env with alignment
         let env_ptr_in_slot = out.alloc_aligned(env_size, env_align);
@@ -313,7 +270,7 @@ where
                 env_ptr_in_slot
             },
             args_ptr_in_slot,
-            vt_ptr_in_slot as *const (),
+            vt_ptr as *const (),
         )
     };
 
@@ -388,6 +345,7 @@ where
 ///     assert_eq!(sum, 3);
 /// }
 /// ```
+#[inline(always)]
 pub unsafe fn decode_and_call<Args, Ret>(
     hdr: &RequestRecordHeader,
     // Caller deserializes Args from the bytes that follow the capture.
