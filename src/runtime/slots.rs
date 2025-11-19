@@ -84,6 +84,7 @@ pub struct RequestRecordHeader {
     pub captured_len: u32,
     pub args_len: u32,
     pub args_offset: u32,
+    pub repeat_count: u32,
 }
 
 #[repr(u64)]

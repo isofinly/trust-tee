@@ -146,8 +146,13 @@ impl<T: Send + 'static> Runtime<T> {
 
                             match hdr.property_ptr {
                                 PropertyPtr::CallMutRetUnit => {
-                                    let _: () =
-                                        decode_and_call::<(&mut T,), ()>(&hdr, (&mut prop,));
+                                    // Execute the closure repeat_count times.
+                                    // Note: The closure environment must be safe to reuse (Copy or stateless).
+                                    // apply_batch_mut ensures this by capturing a function pointer.
+                                    for _ in 0..hdr.repeat_count {
+                                        let _: () =
+                                            decode_and_call::<(&mut T,), ()>(&hdr, (&mut prop,));
+                                    }
                                 }
                                 PropertyPtr::CallMutOutPtr => {
                                     // Generic return path: pass pointer to response payload to closure.
@@ -274,6 +279,7 @@ impl<T> Drop for Runtime<T> {
                     captured_len: 0,
                     args_len: 0,
                     args_offset: 0,
+                    repeat_count: 0,
                 };
                 core::ptr::write_unaligned(hdr_ptr, hdr);
                 let resp_word = (&*chan.response.get())

@@ -326,6 +326,7 @@ where
         captured_len: env_size as u32,
         args_len: serialized_args.len() as u32,
         args_offset: (args_ptr_in_slot as usize - (out.base as usize)) as u32,
+        repeat_count: 1,
     }
 }
 

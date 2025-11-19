@@ -231,119 +231,65 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
     #[inline]
     /// Apply a mutation `n` times on the inner value and wait for completion.
     fn apply_batch_mut(&self, f: fn(&mut T), n: u8) {
-        // Delegate to the existing apply_batch_mut implementation
+        if n == 0 {
+            return;
+        }
         unsafe {
             let base = self.chan.request.get() as *mut u8;
-            let hdr_size = core::mem::size_of::<RequestRecordHeader>();
-            let hdr_align = core::mem::align_of::<RequestRecordHeader>();
-            let mut remaining = n;
+            let hdr_offset = header::next_boundary_offset(
+                HEADER_BYTES,
+                core::mem::size_of::<RequestRecordHeader>(),
+                core::mem::align_of::<RequestRecordHeader>(),
+            );
+            let payload_offset = hdr_offset + core::mem::size_of::<RequestRecordHeader>();
 
-            while remaining > 0 {
-                // Compute per-record layout sizes/alignments as done by encode_closure
-                // Each record writes: [ErasedVTable<(&mut T,), ()>] then env for `F` capturing `f`
-                let vt_size = core::mem::size_of::<ErasedVTable<(&mut T,), ()>>();
-                let vt_align = core::mem::align_of::<ErasedVTable<(&mut T,), ()>>();
-                let env_size = core::mem::size_of::<fn(&mut T)>();
-                let env_align = core::mem::align_of::<fn(&mut T)>();
+            let mut w = SlotWriter {
+                base,
+                len: SLOT_BYTES,
+                cursor: payload_offset,
+            };
 
-                let available = SLOT_BYTES;
-                // Estimate max batch size based on payload size.
-                // Payload per record: VT (vt_size) + ENV (env_size).
-                // hdr_size + vt_size + env_size is the strict minimum bytes per request.
-                // Alignment and boundary gaps only increase the size, so this estimate is an upper bound.
-                let min_bytes_per_req = hdr_size + vt_size + env_size;
-                let estimate = available / min_bytes_per_req;
+            // Encode a single record, but set repeat_count = n.
+            // The closure captures `f` (function pointer), which is Copy.
+            // The trustee will execute this closure `n` times.
+            let mut hdr = encode_closure::<_, (&mut T,), ()>(
+                &mut w,
+                PropertyPtr::CallMutRetUnit,
+                move |(p,)| (f)(p),
+                &[],
+            );
+            hdr.repeat_count = n as u32;
 
-                let mut best = 0usize;
-                let try_up_to = core::cmp::min(remaining as usize, estimate);
+            let hdr_ptr = base.add(hdr_offset) as *mut RequestRecordHeader;
+            core::ptr::write_unaligned(hdr_ptr, hdr);
 
-                for k in (1..=try_up_to).rev() {
-                    // 1. Calculate where headers end
-                    let mut cursor = HEADER_BYTES;
-                    for _ in 0..k {
-                        cursor = header::next_boundary_offset(cursor, hdr_size, hdr_align);
-                        cursor += hdr_size;
-                    }
+            // Toggle request ready bit relative to response and set request count to 1.
+            // The trustee sees 1 record, but that record instructs it to repeat `n` times.
+            let resp_word = (&*self.chan.response.get())
+                .primary
+                .header
+                .flags
+                .load(core::sync::atomic::Ordering::Acquire);
+            let req_ready = !header::ready(resp_word);
+            let word = header::pack_ready_count(req_ready, 1);
+            (&*self.chan.request.get())
+                .primary
+                .header
+                .flags
+                .store(word, core::sync::atomic::Ordering::Release);
 
-                    // 2. Simulate encode_closure() layout k times
-                    for _ in 0..k {
-                        // align for VT
-                        cursor = header::next_boundary_offset(cursor, vt_size, vt_align);
-                        cursor += vt_size;
-
-                        // align for ENV
-                        cursor = header::next_boundary_offset(cursor, env_size, env_align);
-                        cursor += env_size;
-                    }
-
-                    if cursor <= available {
-                        best = k;
-                        break; // Found the largest k that fits
-                    }
-                }
-                let batch = core::cmp::max(1, best) as u8;
-
-                // Writer cursor starts AFTER space reserved for all headers in this batch.
-                // We need to recalculate the exact start position for payloads (which is where headers end).
-                let mut payload_start = HEADER_BYTES;
-                for _ in 0..batch {
-                    payload_start = header::next_boundary_offset(payload_start, hdr_size, hdr_align);
-                    payload_start += hdr_size;
-                }
-
-                let mut w = SlotWriter {
-                    base,
-                    len: SLOT_BYTES,
-                    cursor: payload_start,
-                };
-
-                // Encode each record's capture/env.
-                // We also need to track where to write the headers.
-                let mut header_cursor = HEADER_BYTES;
-                for _ in 0..batch {
-                    header_cursor = header::next_boundary_offset(header_cursor, hdr_size, hdr_align);
-
-                    let hdr = encode_closure::<_, (&mut T,), ()>(
-                        &mut w,
-                        PropertyPtr::CallMutRetUnit,
-                        move |(p,)| (f)(p),
-                        &[],
-                    );
-                    let hdr_ptr = base.add(header_cursor) as *mut RequestRecordHeader;
-                    core::ptr::write_unaligned(hdr_ptr, hdr);
-
-                    header_cursor += hdr_size;
-                }
-
-                // Toggle request ready bit relative to response and set request count.
-                let resp_word = (&*self.chan.response.get())
+            // Wait for response toggle to match.
+            let mut budget = WaitBudget::hot();
+            loop {
+                let resp_word_now = (&*self.chan.response.get())
                     .primary
                     .header
                     .flags
                     .load(core::sync::atomic::Ordering::Acquire);
-                let req_ready = !header::ready(resp_word);
-                let word = header::pack_ready_count(req_ready, batch as u32);
-                (&*self.chan.request.get())
-                    .primary
-                    .header
-                    .flags
-                    .store(word, core::sync::atomic::Ordering::Release);
-
-                // Wait for response toggle to match.
-                let mut budget = WaitBudget::hot();
-                loop {
-                    let resp_word_now = (&*self.chan.response.get())
-                        .primary
-                        .header
-                        .flags
-                        .load(core::sync::atomic::Ordering::Acquire);
-                    if header::ready(resp_word_now) == req_ready {
-                        break;
-                    }
-                    budget.step();
+                if header::ready(resp_word_now) == req_ready {
+                    break;
                 }
-
-                remaining -= batch;
+                budget.step();
             }
         }
     }
