@@ -131,8 +131,16 @@ impl<T: Send + 'static> Runtime<T> {
                     let mut processed: usize = 0;
                     unsafe {
                         let base = cp.chan.request.get() as *mut u8;
-                        let mut record_ptr = base.add(HEADER_BYTES) as *const u8;
+                        let mut header_cursor = HEADER_BYTES;
+
                         for _ in 0..req_count {
+                            header_cursor = header::next_boundary_offset(
+                                header_cursor,
+                                core::mem::size_of::<RequestRecordHeader>(),
+                                core::mem::align_of::<RequestRecordHeader>(),
+                            );
+                            let record_ptr = base.add(header_cursor) as *const u8;
+
                             let hdr: RequestRecordHeader =
                                 core::ptr::read_unaligned(record_ptr as *const RequestRecordHeader);
 
@@ -193,8 +201,7 @@ impl<T: Send + 'static> Runtime<T> {
                             }
 
                             // Next record header is laid out immediately after previous header table entry.
-                            record_ptr =
-                                record_ptr.add(core::mem::size_of::<RequestRecordHeader>());
+                            header_cursor += core::mem::size_of::<RequestRecordHeader>();
                             processed += 1;
                         }
                     }
@@ -252,7 +259,12 @@ impl<T> Drop for Runtime<T> {
             });
             unsafe {
                 let base = chan.request.get() as *mut u8;
-                let hdr_ptr = base.add(HEADER_BYTES) as *mut RequestRecordHeader;
+                let hdr_offset = header::next_boundary_offset(
+                    HEADER_BYTES,
+                    core::mem::size_of::<RequestRecordHeader>(),
+                    core::mem::align_of::<RequestRecordHeader>(),
+                );
+                let hdr_ptr = base.add(hdr_offset) as *mut RequestRecordHeader;
                 let hdr = RequestRecordHeader {
                     closure: FatClosurePtr {
                         data: core::ptr::null_mut(),

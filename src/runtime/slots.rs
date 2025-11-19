@@ -41,6 +41,33 @@ pub mod header {
     pub const fn count(word: u32) -> u32 {
         (word & COUNT_MASK) >> COUNT_SHIFT
     }
+
+    /// Returns the next aligned offset, skipping the gap between primary and trailing blocks if necessary.
+    ///
+    /// If an allocation of `size` bytes at `cursor` (aligned to `align`) would cross the
+    /// `PRIMARY_BYTES` boundary (128), this returns `PRIMARY_BYTES` (aligned) instead.
+    /// This ensures that no single allocation straddles the boundary, respecting the
+    /// "written in its entirety to one or the other block" rule.
+    #[inline]
+    pub fn next_boundary_offset(cursor: usize, size: usize, align: usize) -> usize {
+        // 1. Align current cursor
+        // We assume base is aligned to 64, so we can align the offset.
+        // align must be power of two.
+        let mask = align.max(1) - 1;
+        let start = (cursor + mask) & !mask;
+
+        // 2. Check if [start, start + size) crosses PRIMARY_BYTES (128)
+        // We only care if start < 128 and start + size > 128.
+        if start < super::PRIMARY_BYTES && start + size > super::PRIMARY_BYTES {
+            // Skip to PRIMARY_BYTES (start of trailing)
+            // Trailing starts at 128.
+            let new_start = super::PRIMARY_BYTES;
+            // Re-align
+            (new_start + mask) & !mask
+        } else {
+            start
+        }
+    }
 }
 
 /// A 128-bit fat pointer to a Rust closure: { data, vtable }.

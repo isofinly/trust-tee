@@ -117,13 +117,10 @@ impl SlotWriter {
     ///
     /// Returns: a `*mut u8` pointing to the start of the reserved region.
     pub fn alloc_aligned(&mut self, size: usize, align: usize) -> *mut u8 {
-        let base = self.base;
-        let start = base.wrapping_add(self.cursor);
-        let off = start.align_offset(align.max(1));
-        let pos = self.cursor + off;
+        let pos = crate::runtime::slots::header::next_boundary_offset(self.cursor, size, align);
         self.cursor = pos + size;
         assert!(self.cursor <= self.len, "slot overflow");
-        unsafe { base.add(pos) }
+        unsafe { self.base.add(pos) }
     }
 
     /// Writes the given `bytes` at the current cursor (no additional alignment)
@@ -264,19 +261,11 @@ where
 
     // Build vtable locally and place it inside the slot for this record.
     let (env_ptr, args_ptr_in_slot, vt_ptr_any) = unsafe {
-        // Base pointer and current cursor
-        let base = out.base;
-        let len = out.len;
-        let cursor0 = out.cursor;
-
         // 1) Allocate space for vtable
-        let vt_align = align_of::<ErasedVTable<Args, Ret>>();
-        let start_vt = base.wrapping_add(cursor0);
-        let off_vt = start_vt.align_offset(vt_align.max(1));
-        let vt_pos = cursor0 + off_vt;
-        let after_vt = vt_pos + size_of::<ErasedVTable<Args, Ret>>();
-        assert!(after_vt <= len, "slot overflow");
-        let vt_ptr_in_slot = base.add(vt_pos) as *mut ErasedVTable<Args, Ret>;
+        let vt_ptr_in_slot = out.alloc_aligned(
+            size_of::<ErasedVTable<Args, Ret>>(),
+            align_of::<ErasedVTable<Args, Ret>>(),
+        ) as *mut ErasedVTable<Args, Ret>;
 
         // Initialize vtable for F
         let vt_value = ErasedVTable::<Args, Ret> {
@@ -302,12 +291,7 @@ where
         ptr::write(vt_ptr_in_slot, vt_value);
 
         // 2) Allocate env with alignment
-        let start_env = base.wrapping_add(after_vt);
-        let off_env = start_env.align_offset(env_align.max(1));
-        let env_pos = after_vt + off_env;
-        let after_env = env_pos + env_size;
-        assert!(after_env <= len, "slot overflow");
-        let env_ptr_in_slot = base.add(env_pos);
+        let env_ptr_in_slot = out.alloc_aligned(env_size, env_align);
 
         // Write F into env (if non-ZST)
         if env_size != 0 {
@@ -315,18 +299,12 @@ where
         }
 
         // 3) Args are written immediately after env; args alignment is 1
-        let args_pos = after_env;
-        let after_args = args_pos + serialized_args.len();
-        assert!(after_args <= len, "slot overflow");
-        let args_ptr_in_slot = base.add(args_pos);
+        let args_ptr_in_slot = out.alloc_aligned(serialized_args.len(), 1);
         ptr::copy_nonoverlapping(
             serialized_args.as_ptr(),
             args_ptr_in_slot,
             serialized_args.len(),
         );
-
-        // Advance cursor once at the end
-        out.cursor = after_args;
 
         (
             if env_size == 0 {

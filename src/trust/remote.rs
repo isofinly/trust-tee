@@ -51,10 +51,17 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
     {
         unsafe {
             let base = self.chan.request.get() as *mut u8;
+            let hdr_offset = header::next_boundary_offset(
+                HEADER_BYTES,
+                core::mem::size_of::<RequestRecordHeader>(),
+                core::mem::align_of::<RequestRecordHeader>(),
+            );
+            let payload_offset = hdr_offset + core::mem::size_of::<RequestRecordHeader>();
+
             let mut w = SlotWriter {
                 base,
                 len: SLOT_BYTES,
-                cursor: HEADER_BYTES + core::mem::size_of::<RequestRecordHeader>(),
+                cursor: payload_offset,
             };
             // Encode closure that writes its return value into response slot.
             let hdr = encode_closure::<_, (&mut T, *mut u8), ()>(
@@ -66,7 +73,7 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
                 },
                 &[],
             );
-            let hdr_ptr = base.add(HEADER_BYTES) as *mut RequestRecordHeader;
+            let hdr_ptr = base.add(hdr_offset) as *mut RequestRecordHeader;
             core::ptr::write_unaligned(hdr_ptr, hdr);
 
             // Signal request ready
@@ -115,10 +122,17 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
     {
         unsafe {
             let base = self.chan.request.get() as *mut u8;
+            let hdr_offset = header::next_boundary_offset(
+                HEADER_BYTES,
+                core::mem::size_of::<RequestRecordHeader>(),
+                core::mem::align_of::<RequestRecordHeader>(),
+            );
+            let payload_offset = hdr_offset + core::mem::size_of::<RequestRecordHeader>();
+
             let mut wtr = SlotWriter {
                 base,
                 len: SLOT_BYTES,
-                cursor: HEADER_BYTES + core::mem::size_of::<RequestRecordHeader>(),
+                cursor: payload_offset,
             };
             // Serialize argument `w` into args buffer; trustee will deserialize.
             let args = bincode::serialize(&w).expect("bincode serialize");
@@ -133,7 +147,7 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
                 },
                 &args,
             );
-            let hdr_ptr = base.add(HEADER_BYTES) as *mut RequestRecordHeader;
+            let hdr_ptr = base.add(hdr_offset) as *mut RequestRecordHeader;
             core::ptr::write_unaligned(hdr_ptr, hdr);
 
             let resp_flags = self.chan.response.get() as *const core::sync::atomic::AtomicU32;
@@ -167,10 +181,17 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
     {
         unsafe {
             let base = self.chan.request.get() as *mut u8;
+            let hdr_offset = header::next_boundary_offset(
+                HEADER_BYTES,
+                core::mem::size_of::<RequestRecordHeader>(),
+                core::mem::align_of::<RequestRecordHeader>(),
+            );
+            let payload_offset = hdr_offset + core::mem::size_of::<RequestRecordHeader>();
+
             let mut w = SlotWriter {
                 base,
                 len: SLOT_BYTES,
-                cursor: HEADER_BYTES + core::mem::size_of::<RequestRecordHeader>(),
+                cursor: payload_offset,
             };
             // Invoke f with &T view and write result into response
             let hdr = encode_closure::<_, (&mut T, *mut u8), ()>(
@@ -182,7 +203,7 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
                 },
                 &[],
             );
-            let hdr_ptr = base.add(HEADER_BYTES) as *mut RequestRecordHeader;
+            let hdr_ptr = base.add(hdr_offset) as *mut RequestRecordHeader;
             core::ptr::write_unaligned(hdr_ptr, hdr);
 
             let resp_flags = self.chan.response.get() as *const core::sync::atomic::AtomicU32;
@@ -214,6 +235,7 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
         unsafe {
             let base = self.chan.request.get() as *mut u8;
             let hdr_size = core::mem::size_of::<RequestRecordHeader>();
+            let hdr_align = core::mem::align_of::<RequestRecordHeader>();
             let mut remaining = n;
 
             while remaining > 0 {
@@ -224,62 +246,73 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
                 let env_size = core::mem::size_of::<fn(&mut T)>();
                 let env_align = core::mem::align_of::<fn(&mut T)>();
 
-                let available = SLOT_BYTES - HEADER_BYTES;
-                let cap_by_headers = available / hdr_size;
+                let available = SLOT_BYTES;
+                // Estimate max batch size based on payload size.
+                // Payload per record: VT (vt_size) + ENV (env_size).
+                // hdr_size + vt_size + env_size is the strict minimum bytes per request.
+                // Alignment and boundary gaps only increase the size, so this estimate is an upper bound.
+                let min_bytes_per_req = hdr_size + vt_size + env_size;
+                let estimate = available / min_bytes_per_req;
+
                 let mut best = 0usize;
-                let try_up_to = core::cmp::min(remaining as usize, cap_by_headers);
-                for k in 1..=try_up_to {
-                    // Start cursor after the header table for k records
-                    let mut cursor = HEADER_BYTES + k * hdr_size;
-                    // Simulate encode_closure() layout k times: align+write VT, align+write ENV, no args
+                let try_up_to = core::cmp::min(remaining as usize, estimate);
+
+                for k in (1..=try_up_to).rev() {
+                    // 1. Calculate where headers end
+                    let mut cursor = HEADER_BYTES;
+                    for _ in 0..k {
+                        cursor = header::next_boundary_offset(cursor, hdr_size, hdr_align);
+                        cursor += hdr_size;
+                    }
+
+                    // 2. Simulate encode_closure() layout k times
                     for _ in 0..k {
                         // align for VT
-                        let mask_vt = vt_align.saturating_sub(1);
-                        if mask_vt != 0 {
-                            let rem = cursor & mask_vt;
-                            if rem != 0 {
-                                cursor += vt_align - rem;
-                            }
-                        }
+                        cursor = header::next_boundary_offset(cursor, vt_size, vt_align);
                         cursor += vt_size;
 
                         // align for ENV
-                        let mask_env = env_align.saturating_sub(1);
-                        if mask_env != 0 {
-                            let rem = cursor & mask_env;
-                            if rem != 0 {
-                                cursor += env_align - rem;
-                            }
-                        }
-                        cursor += env_size; // args_len == 0 for this path
+                        cursor = header::next_boundary_offset(cursor, env_size, env_align);
+                        cursor += env_size;
                     }
 
-                    if cursor - HEADER_BYTES <= available {
+                    if cursor <= available {
                         best = k;
-                    } else {
-                        break;
+                        break; // Found the largest k that fits
                     }
                 }
                 let batch = core::cmp::max(1, best) as u8;
 
                 // Writer cursor starts AFTER space reserved for all headers in this batch.
+                // We need to recalculate the exact start position for payloads (which is where headers end).
+                let mut payload_start = HEADER_BYTES;
+                for _ in 0..batch {
+                    payload_start = header::next_boundary_offset(payload_start, hdr_size, hdr_align);
+                    payload_start += hdr_size;
+                }
+
                 let mut w = SlotWriter {
                     base,
                     len: SLOT_BYTES,
-                    cursor: HEADER_BYTES + (hdr_size * batch as usize),
+                    cursor: payload_start,
                 };
 
-                // Encode each record's capture/env immediately after the header table.
-                for i in 0..batch {
+                // Encode each record's capture/env.
+                // We also need to track where to write the headers.
+                let mut header_cursor = HEADER_BYTES;
+                for _ in 0..batch {
+                    header_cursor = header::next_boundary_offset(header_cursor, hdr_size, hdr_align);
+
                     let hdr = encode_closure::<_, (&mut T,), ()>(
                         &mut w,
                         PropertyPtr::CallMutRetUnit,
                         move |(p,)| (f)(p),
                         &[],
                     );
-                    let hdr_ptr = base.add(HEADER_BYTES + (i as usize) * hdr_size)
-                        as *mut RequestRecordHeader;
+                    let hdr_ptr = base.add(header_cursor) as *mut RequestRecordHeader;
                     core::ptr::write_unaligned(hdr_ptr, hdr);
+
+                    header_cursor += hdr_size;
                 }
 
                 // Toggle request ready bit relative to response and set request count.
@@ -325,15 +358,22 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
         );
         unsafe {
             let base = self.chan.request.get() as *mut u8;
+            let hdr_offset = header::next_boundary_offset(
+                HEADER_BYTES,
+                core::mem::size_of::<RequestRecordHeader>(),
+                core::mem::align_of::<RequestRecordHeader>(),
+            );
+            let payload_offset = hdr_offset + core::mem::size_of::<RequestRecordHeader>();
+
             let mut w = SlotWriter {
                 base,
                 len: SLOT_BYTES,
-                cursor: HEADER_BYTES + core::mem::size_of::<RequestRecordHeader>(),
+                cursor: payload_offset,
             };
             // property_ptr=4 instructs the worker to move out T into the response and terminate.
             let hdr =
                 encode_closure::<_, (&mut T,), ()>(&mut w, PropertyPtr::IntoInner, |_p| (), &[]);
-            let hdr_ptr = base.add(HEADER_BYTES) as *mut RequestRecordHeader;
+            let hdr_ptr = base.add(hdr_offset) as *mut RequestRecordHeader;
             core::ptr::write_unaligned(hdr_ptr, hdr);
 
             // Signal request ready with count=1
