@@ -16,12 +16,22 @@ use crate::{
 // Concrete, zero-overhead registrar to register new ChannelPairs with the worker.
 pub(crate) struct Registrar<T> {
     reg: Arc<SegQueue<ClientPair<T>>>,
+    pub(crate) trustee_id: Arc<core::sync::atomic::AtomicUsize>,
+    pub(crate) trustee_prop: Arc<core::sync::atomic::AtomicPtr<()>>,
 }
 
 impl<T> Registrar<T> {
     #[inline]
-    fn new(reg: Arc<SegQueue<ClientPair<T>>>) -> Self {
-        Self { reg }
+    fn new(
+        reg: Arc<SegQueue<ClientPair<T>>>,
+        trustee_id: Arc<core::sync::atomic::AtomicUsize>,
+        trustee_prop: Arc<core::sync::atomic::AtomicPtr<()>>,
+    ) -> Self {
+        Self {
+            reg,
+            trustee_id,
+            trustee_prop,
+        }
     }
     #[inline]
     pub(crate) fn register(&self, chan: Arc<ChannelPair>) {
@@ -36,6 +46,8 @@ impl<T> Clone for Registrar<T> {
     fn clone(&self) -> Self {
         Self {
             reg: self.reg.clone(),
+            trustee_id: self.trustee_id.clone(),
+            trustee_prop: self.trustee_prop.clone(),
         }
     }
 }
@@ -48,6 +60,8 @@ struct ClientPair<T> {
 /// Runtime hosting a property `T` on a worker thread and serving clients.
 pub struct Runtime<T> {
     reg: Arc<SegQueue<ClientPair<T>>>,
+    trustee_id: Arc<core::sync::atomic::AtomicUsize>,
+    trustee_prop: Arc<core::sync::atomic::AtomicPtr<()>>,
     _worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -55,6 +69,8 @@ impl<T> Clone for Runtime<T> {
     fn clone(&self) -> Self {
         Runtime {
             reg: self.reg.clone(),
+            trustee_id: self.trustee_id.clone(),
+            trustee_prop: self.trustee_prop.clone(),
             _worker: None,
         }
     }
@@ -71,11 +87,31 @@ impl<T: Send + 'static> Runtime<T> {
         let reg: Arc<SegQueue<ClientPair<T>>> = Arc::new(SegQueue::new());
         let reg_consumer = reg.clone();
 
+        // Shared atomic storage for trustee identification.
+        let trustee_id = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let trustee_prop = Arc::new(core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()));
+
+        let worker_trustee_id = trustee_id.clone();
+        let worker_trustee_prop = trustee_prop.clone();
+
         let _worker = thread::spawn(move || {
             if let Some(cfg) = pin {
                 pin_current_thread(&cfg);
             }
             let mut prop = value;
+
+            // Publish trustee thread ID and property pointer once.
+            // Since `prop` is on the stack and won't move (we don't yield across moves), this is safe.
+            // However, we must ensure `prop` stays valid. It lives as long as this loop.
+            worker_trustee_id.store(
+                crate::util::thread_id::get_thread_id(),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            worker_trustee_prop.store(
+                &mut prop as *mut T as *mut (),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+
             let mut clients: SmallVec<[ClientPair<T>; 64]> = SmallVec::new();
             let mut start_idx: usize = 0;
             let mut idle_rounds: u32 = 0;
@@ -226,14 +262,31 @@ impl<T: Send + 'static> Runtime<T> {
         });
 
         let rt = Runtime {
-            reg,
+            reg: reg.clone(),
+            trustee_id: trustee_id.clone(),
+            trustee_prop: trustee_prop.clone(),
             _worker: Some(_worker),
         };
-        let handle = rt.entrust();
+
+        // Manually construct the first remote handle to avoid circular dependency or complex signature
+        let chan = Arc::new(ChannelPair::default());
+        reg.push(ClientPair {
+            chan: chan.clone(),
+            _phantom: PhantomData,
+        });
+
+        let registrar = Registrar::new(reg, trustee_id, trustee_prop);
+        let handle = Remote {
+            chan,
+            registrar,
+            _phantom: PhantomData,
+            _owner: Some(rt.clone()),
+            _not_sync: core::marker::PhantomData,
+        };
+
         (rt, handle)
     }
 
-    #[inline]
     /// Create a client handle by registering a channel pair with the worker.
     pub fn entrust(&self) -> Remote<T> {
         let chan = Arc::new(ChannelPair::default());
@@ -242,7 +295,11 @@ impl<T: Send + 'static> Runtime<T> {
             _phantom: PhantomData,
         });
 
-        let registrar = Registrar::new(self.reg.clone());
+        let registrar = Registrar::new(
+            self.reg.clone(),
+            self.trustee_id.clone(),
+            self.trustee_prop.clone(),
+        );
         Remote {
             chan,
             registrar,

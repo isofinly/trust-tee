@@ -2,7 +2,7 @@
 use core::{mem::align_of, mem::size_of};
 
 use std::ptr;
-use std::sync::OnceLock;
+
 
 use crate::runtime::slots::{
     Aligned, ErasedVTable, FatClosurePtr, PropertyPtr, RequestRecordHeader, SLOT_BYTES,

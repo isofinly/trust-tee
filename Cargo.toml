@@ -40,3 +40,7 @@ harness = false
 [[bench]]
 name = "perf_pinned_remote"
 harness = false
+
+[[bench]]
+name = "local_shortcut"
+harness = false
