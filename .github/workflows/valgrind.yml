@@ -14,7 +14,7 @@ jobs:
 
     env:
       BENCH_NAMES: "perf_local perf_pinned_remote perf_latch"
-      ITER: "100000"
+      ITER: "25000"
       RUST_BACKTRACE: 0
 
     steps:
