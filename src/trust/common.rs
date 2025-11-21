@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 /// A trait for types that can manage trust over a property.
 pub trait TrustLike {
     /// The type of value being managed.
@@ -38,6 +40,20 @@ pub trait TrustLike {
 
     /// Apply a mutation `n` times on the inner value and wait for completion.
     fn apply_batch_mut(&self, f: fn(&mut Self::Value), n: u8);
+
+    /// Launch a fiber to execute `f` on the inner value.
+    /// This is intended for `Latch<T>` or other types that support concurrent access.
+    /// The closure `f` takes `&Self::Value` (shared reference) to allow concurrency.
+    fn launch<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&Self::Value) -> R + Send + 'static,
+        R: Send + 'static;
+
+    /// Launch `f`, then enqueue `then` to run with the result.
+    fn launch_then<F, R>(&self, f: F, then: impl FnOnce(R))
+    where
+        F: FnOnce(&Self::Value) -> R + Send + 'static,
+        R: Send + 'static;
 }
 
 /// A generic wrapper around any implementation of `TrustLike`.
@@ -97,6 +113,25 @@ impl<T: TrustLike> Trust<T> {
     pub fn apply_batch_mut(&self, f: fn(&mut T::Value), n: u8) {
         self.inner.apply_batch_mut(f, n);
     }
+
+    /// Launch a fiber to execute `f` on the inner value.
+    /// This is intended for `Latch<T>` or other types that support concurrent access.
+    pub fn launch<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&T::Value) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.inner.launch::<F, R>(f)
+    }
+
+    /// Launch `f`, then enqueue `then` to run with the result.
+    pub fn launch_then<F, R>(&self, f: F, then: impl FnOnce(R))
+    where
+        F: FnOnce(&T::Value) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.inner.launch_then::<F, R>(f, then)
+    }
 }
 
 impl<T: TrustLike> core::fmt::Display for Trust<T>
@@ -146,7 +181,7 @@ impl<T: Send + 'static> Trust<super::remote::Remote<T>> {
                 chan: handle.chan.clone(),
                 registrar: handle.registrar.clone(),
                 _phantom: core::marker::PhantomData,
-                _owner: Some(rt),
+                _owner: Some(Arc::new(rt)),
                 _not_sync: core::marker::PhantomData,
             },
         }

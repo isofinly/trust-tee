@@ -23,7 +23,7 @@ pub fn pin_current_thread(cfg: &PinConfig) {
         let _ = cfg;
         return;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(miri)))]
     {
         use core::mem::{size_of, zeroed};
         unsafe {
@@ -56,7 +56,7 @@ pub fn pin_current_thread(cfg: &PinConfig) {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", not(miri)))]
     {
         unsafe {
             if let Some(tag) = cfg.mac_affinity_tag {

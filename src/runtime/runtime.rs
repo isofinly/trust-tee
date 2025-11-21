@@ -1,7 +1,7 @@
 use core::marker::PhantomData;
 use crossbeam_queue::SegQueue;
 use smallvec::SmallVec;
-use std::{sync::Arc, thread};
+use std::sync::Arc;
 
 use crate::{
     runtime::serialization::decode_and_call,
@@ -9,8 +9,7 @@ use crate::{
         ChannelPair, FatClosurePtr, HEADER_BYTES, PropertyPtr, RequestRecordHeader, header,
     },
     trust::remote::Remote,
-    util::WaitBudget,
-    util::affinity::{PinConfig, pin_current_thread},
+    util::affinity::PinConfig,
 };
 
 // Concrete, zero-overhead registrar to register new ChannelPairs with the worker.
@@ -37,6 +36,7 @@ impl<T> Registrar<T> {
     pub(crate) fn register(&self, chan: Arc<ChannelPair>) {
         self.reg.push(ClientPair {
             chan,
+            pending_launch: false,
             _phantom: PhantomData,
         });
     }
@@ -54,6 +54,7 @@ impl<T> Clone for Registrar<T> {
 
 struct ClientPair<T> {
     chan: Arc<ChannelPair>,
+    pending_launch: bool,
     _phantom: PhantomData<T>,
 }
 
@@ -62,7 +63,7 @@ pub struct Runtime<T> {
     reg: Arc<SegQueue<ClientPair<T>>>,
     trustee_id: Arc<core::sync::atomic::AtomicUsize>,
     trustee_prop: Arc<core::sync::atomic::AtomicPtr<()>>,
-    _worker: Option<thread::JoinHandle<()>>,
+    _worker: Option<crate::util::fiber::JoinHandle<()>>,
 }
 
 impl<T> Clone for Runtime<T> {
@@ -83,183 +84,287 @@ impl<T: Send + 'static> Runtime<T> {
     }
 
     /// Spawn a remote runtime worker with explicit `burst` and optional pinning.
-    pub fn spawn_with_pin(value: T, _burst: usize, pin: Option<PinConfig>) -> (Self, Remote<T>) {
+    pub fn spawn_with_pin(value: T, _burst: usize, _pin: Option<PinConfig>) -> (Self, Remote<T>) {
         let reg: Arc<SegQueue<ClientPair<T>>> = Arc::new(SegQueue::new());
         let reg_consumer = reg.clone();
 
-        // Shared atomic storage for trustee identification.
         let trustee_id = Arc::new(core::sync::atomic::AtomicUsize::new(0));
         let trustee_prop = Arc::new(core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()));
 
         let worker_trustee_id = trustee_id.clone();
         let worker_trustee_prop = trustee_prop.clone();
 
-        let _worker = thread::spawn(move || {
-            if let Some(cfg) = pin {
-                pin_current_thread(&cfg);
-            }
-            let mut prop = value;
+        let _worker = unsafe {
+            crate::util::fiber::Builder::new()
+                .name("trustee".to_string())
+                .spawn(move || {
+                    // Note: PinConfig is ignored here as may manages threads.
 
-            // Publish trustee thread ID and property pointer once.
-            // Since `prop` is on the stack and won't move (we don't yield across moves), this is safe.
-            // However, we must ensure `prop` stays valid. It lives as long as this loop.
-            worker_trustee_id.store(
-                crate::util::thread_id::get_thread_id(),
-                core::sync::atomic::Ordering::Relaxed,
-            );
-            worker_trustee_prop.store(
-                &mut prop as *mut T as *mut (),
-                core::sync::atomic::Ordering::Relaxed,
-            );
+                    // Wrap prop in Arc<UnsafeCell> to allow shared ownership between worker and fibers.
+                    // This prevents use-after-free if the worker exits while a fiber is still running.
+                    let prop = Arc::new(core::cell::UnsafeCell::new(value));
 
-            let mut clients: SmallVec<[ClientPair<T>; 64]> = SmallVec::new();
-            let mut start_idx: usize = 0;
-            let mut idle_rounds: u32 = 0;
+                    // Publish trustee thread ID and property pointer once.
+                    worker_trustee_id.store(
+                        crate::util::thread_id::get_thread_id(),
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
+                    worker_trustee_prop.store(
+                        prop.as_ref().get() as *mut (),
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
 
-            loop {
-                // Drain registrations in bounded chunks.
-                let mut drained = 0;
-                while drained < 256 {
-                    {
-                        match reg_consumer.pop() {
-                            Some(cp) => {
-                                clients.push(cp);
-                                drained += 1;
-                            }
-                            None => break,
-                        }
-                    }
-                }
+                    let mut clients: SmallVec<[ClientPair<T>; 64]> = SmallVec::new();
+                    let mut start_idx: usize = 0;
+                    let mut idle_rounds: u32 = 0;
 
-                if clients.is_empty() {
-                    // Light idle: short spin, then yield; never park.
-                    if idle_rounds < 8 {
-                        core::hint::spin_loop();
-                        idle_rounds += 1;
-                    } else {
-                        std::thread::yield_now();
-                        idle_rounds = 0;
-                    }
-                    continue;
-                }
-
-                let n = clients.len();
-                let mut progressed = false;
-
-                for offs in 0..n {
-                    let idx = (start_idx + offs) % n;
-                    let cp = &clients[idx];
-
-                    let req_flags = cp.chan.request.get() as *const core::sync::atomic::AtomicU32;
-                    let resp_flags = cp.chan.response.get() as *const core::sync::atomic::AtomicU32;
-                    let req_word =
-                        unsafe { (*req_flags).load(core::sync::atomic::Ordering::Acquire) };
-                    let resp_word =
-                        unsafe { (*resp_flags).load(core::sync::atomic::Ordering::Acquire) };
-                    let req_ready = header::ready(req_word);
-                    let resp_ready = header::ready(resp_word);
-                    if req_ready == resp_ready {
-                        continue;
-                    }
-
-                    // Process a batch of request records according to the request count.
-                    let req_count = header::count(req_word) as usize;
-                    let mut processed: usize = 0;
-                    unsafe {
-                        let base = cp.chan.request.get() as *mut u8;
-                        let mut header_cursor = HEADER_BYTES;
-
-                        for _ in 0..req_count {
-                            header_cursor = header::next_boundary_offset(
-                                header_cursor,
-                                core::mem::size_of::<RequestRecordHeader>(),
-                                core::mem::align_of::<RequestRecordHeader>(),
-                            );
-                            let record_ptr = base.add(header_cursor) as *const u8;
-
-                            let hdr: RequestRecordHeader =
-                                core::ptr::read_unaligned(record_ptr as *const RequestRecordHeader);
-
-                            match hdr.property_ptr {
-                                PropertyPtr::CallMutRetUnit => {
-                                    // Execute the closure repeat_count times.
-                                    // Note: The closure environment must be safe to reuse (Copy or stateless).
-                                    // apply_batch_mut ensures this by capturing a function pointer.
-                                    for _ in 0..hdr.repeat_count {
-                                        let _: () =
-                                            decode_and_call::<(&mut T,), ()>(&hdr, (&mut prop,));
+                    loop {
+                        // Drain registrations in bounded chunks.
+                        let mut drained = 0;
+                        while drained < 256 {
+                            {
+                                match reg_consumer.pop() {
+                                    Some(cp) => {
+                                        clients.push(cp);
+                                        drained += 1;
                                     }
+                                    None => break,
                                 }
-                                PropertyPtr::CallMutOutPtr => {
-                                    // Generic return path: pass pointer to response payload to closure.
-                                    let resp_base = cp.chan.response.get() as *mut u8;
-                                    let resp_data = resp_base.add(HEADER_BYTES);
-                                    let _: () = decode_and_call::<(&mut T, *mut u8), ()>(
-                                        &hdr,
-                                        (&mut prop, resp_data),
-                                    );
-                                }
-                                PropertyPtr::CallMutArgsOutPtr => {
-                                    // Serialized-args path: use header-provided args_offset to maintain strict provenance.
-                                    let resp_base = cp.chan.response.get() as *mut u8;
-                                    let resp_data = resp_base.add(HEADER_BYTES);
-                                    let base = cp.chan.request.get() as *mut u8;
-                                    let args_ptr = base.add(hdr.args_offset as usize) as *const u8;
-                                    let args_len = hdr.args_len;
-                                    let _: () =
-                                        decode_and_call::<(&mut T, *mut u8, *const u8, u32), ()>(
-                                            &hdr,
-                                            (&mut prop, resp_data, args_ptr, args_len),
-                                        );
-                                }
-                                PropertyPtr::IntoInner => {
-                                    // Move the inner T into the response buffer, signal, then terminate.
-                                    let resp_base = cp.chan.response.get() as *mut u8;
-                                    let resp_data = resp_base.add(HEADER_BYTES);
-                                    // Move out of prop and write into response payload
-                                    core::ptr::write_unaligned(
-                                        resp_data.cast::<T>(),
-                                        core::ptr::read(&mut prop as *mut T),
-                                    );
+                            }
+                        }
 
-                                    // Toggle response ready bit to match current request and set count=1
-                                    let req_flags = cp.chan.request.get()
-                                        as *const core::sync::atomic::AtomicU32;
-                                    let resp_flags = cp.chan.response.get()
-                                        as *const core::sync::atomic::AtomicU32;
-                                    let req_word_now = {
-                                        (*req_flags).load(core::sync::atomic::Ordering::Acquire)
-                                    };
-                                    let req_ready_now = header::ready(req_word_now);
-                                    let new_word = header::pack_ready_count(req_ready_now, 1);
-                                    (*resp_flags)
-                                        .store(new_word, core::sync::atomic::Ordering::Release);
-                                    return;
-                                }
-                                PropertyPtr::Terminate => {
-                                    return;
+                        if clients.is_empty() {
+                            // Light idle: short spin, then yield; never park.
+                            if idle_rounds < 8 {
+                                core::hint::spin_loop();
+                                idle_rounds += 1;
+                            } else {
+                                crate::util::fiber::yield_now();
+                                idle_rounds = 0;
+                            }
+                            continue;
+                        }
+
+                        let n = clients.len();
+                        let mut progressed = false;
+
+                        for offs in 0..n {
+                            let idx = (start_idx + offs) % n;
+                            let cp = &mut clients[idx];
+
+                            let req_flags =
+                                cp.chan.request.get() as *const core::sync::atomic::AtomicU32;
+                            let resp_flags =
+                                cp.chan.response.get() as *const core::sync::atomic::AtomicU32;
+                            let req_word = (*req_flags).load(core::sync::atomic::Ordering::Acquire);
+                            let resp_word =
+                                (*resp_flags).load(core::sync::atomic::Ordering::Acquire);
+                            let req_ready = header::ready(req_word);
+                            let resp_ready = header::ready(resp_word);
+
+                            if cp.pending_launch {
+                                if req_ready == resp_ready {
+                                    // Launch completed (fiber flipped the bit).
+                                    cp.pending_launch = false;
+                                } else {
+                                    // Launch still in progress. Skip.
+                                    continue;
                                 }
                             }
 
-                            // Next record header is laid out immediately after previous header table entry.
-                            header_cursor += core::mem::size_of::<RequestRecordHeader>();
-                            processed += 1;
+                            if req_ready == resp_ready {
+                                continue;
+                            }
+
+                            // Process a batch of request records according to the request count.
+                            let req_count = header::count(req_word) as usize;
+                            let mut processed: usize = 0;
+                            let mut deferred_response = false;
+
+                            {
+                                let base = cp.chan.request.get() as *mut u8;
+                                let mut header_cursor = HEADER_BYTES;
+
+                                for _ in 0..req_count {
+                                    header_cursor = header::next_boundary_offset(
+                                        header_cursor,
+                                        core::mem::size_of::<RequestRecordHeader>(),
+                                        core::mem::align_of::<RequestRecordHeader>(),
+                                    );
+                                    let record_ptr = base.add(header_cursor) as *const u8;
+
+                                    let hdr: RequestRecordHeader = core::ptr::read_unaligned(
+                                        record_ptr as *const RequestRecordHeader,
+                                    );
+
+                                    match hdr.property_ptr {
+                                        PropertyPtr::CallMutRetUnit => {
+                                            for _ in 0..hdr.repeat_count {
+                                                let _: () = decode_and_call::<(&mut T,), ()>(
+                                                    &hdr,
+                                                    (&mut *prop.as_ref().get(),),
+                                                );
+                                            }
+                                        }
+                                        PropertyPtr::CallMutOutPtr => {
+                                            let resp_base = cp.chan.response.get() as *mut u8;
+                                            let resp_data = resp_base.add(HEADER_BYTES);
+                                            let _: () = decode_and_call::<(&mut T, *mut u8), ()>(
+                                                &hdr,
+                                                (&mut *prop.as_ref().get(), resp_data),
+                                            );
+                                        }
+                                        PropertyPtr::CallMutArgsOutPtr => {
+                                            let resp_base = cp.chan.response.get() as *mut u8;
+                                            let resp_data = resp_base.add(HEADER_BYTES);
+                                            let base = cp.chan.request.get() as *mut u8;
+                                            let args_ptr =
+                                                base.add(hdr.args_offset as usize) as *const u8;
+                                            let args_len = hdr.args_len;
+                                            let _: () = decode_and_call::<
+                                                (&mut T, *mut u8, *const u8, u32),
+                                                (),
+                                            >(
+                                                &hdr,
+                                                (
+                                                    &mut *prop.as_ref().get(),
+                                                    resp_data,
+                                                    args_ptr,
+                                                    args_len,
+                                                ),
+                                            );
+                                        }
+                                        PropertyPtr::IntoInner => {
+                                            let resp_base = cp.chan.response.get() as *mut u8;
+                                            let resp_data = resp_base.add(HEADER_BYTES);
+                                            core::ptr::write_unaligned(
+                                                resp_data.cast::<T>(),
+                                                core::ptr::read(prop.as_ref().get()),
+                                            );
+
+                                            let req_flags = cp.chan.request.get()
+                                                as *const core::sync::atomic::AtomicU32;
+                                            let resp_flags = cp.chan.response.get()
+                                                as *const core::sync::atomic::AtomicU32;
+                                            let req_word_now = {
+                                                (*req_flags)
+                                                    .load(core::sync::atomic::Ordering::Acquire)
+                                            };
+                                            let req_ready_now = header::ready(req_word_now);
+                                            let new_word =
+                                                header::pack_ready_count(req_ready_now, 1);
+                                            (*resp_flags).store(
+                                                new_word,
+                                                core::sync::atomic::Ordering::Release,
+                                            );
+                                            return;
+                                        }
+                                        PropertyPtr::Launch => {
+                                            deferred_response = true;
+                                            cp.pending_launch = true;
+
+                                            // Capture necessary data for the fiber
+                                            // We move an Arc<UnsafeCell<T>> to the fiber.
+                                            // Since Arc<UnsafeCell<T>> is !Send, we convert to raw pointer.
+                                            let prop_raw = Arc::into_raw(prop.clone())
+                                                as *mut core::cell::UnsafeCell<T>;
+                                            // Use AtomicPtr to carry the raw pointer safely.
+                                            let prop_ptr_carrier =
+                                                core::sync::atomic::AtomicPtr::new(prop_raw);
+
+                                            let resp_base = cp.chan.response.get() as *mut u8;
+                                            let resp_data = core::sync::atomic::AtomicPtr::new(
+                                                resp_base.add(HEADER_BYTES),
+                                            );
+                                            let resp_flags = core::sync::atomic::AtomicPtr::new(
+                                                cp.chan.response.get()
+                                                    as *mut core::sync::atomic::AtomicU32,
+                                            );
+
+                                            // We need to copy `hdr` to the fiber because it's on the stack.
+                                            // RequestRecordHeader is Send now.
+                                            let hdr_copy = hdr;
+
+                                            // Spawn pinned fiber
+                                            crate::util::fiber::Builder::new()
+                                                .spawn(move || {
+                                                    // Reconstruct Arc to ensure cleanup.
+                                                    let prop_raw = prop_ptr_carrier.load(
+                                                        core::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    // Safety: We created this pointer from Arc::into_raw.
+                                                    let prop_arc = Arc::from_raw(prop_raw);
+                                                    let prop_ptr = prop_arc.get();
+
+                                                    let resp_data = resp_data.load(
+                                                        core::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    let resp_flags = resp_flags.load(
+                                                        core::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    let hdr = hdr_copy;
+
+                                                    // Execute the closure.
+                                                    // Note: We pass `&mut *prop_ptr` but we treat it as shared if T is Latch.
+                                                    // The closure signature for Launch should probably be `FnOnce(&T)`.
+                                                    // But `decode_and_call` is generic.
+                                                    // If we use `CallMutOutPtr` logic (FnOnce(&mut T, *mut u8)), we get `&mut T`.
+                                                    // This is technically aliasing if main loop also uses `&mut T`.
+                                                    // But since we are in UnsafeCell land, we just need to avoid data races.
+                                                    // If T is Latch, it is safe.
+                                                    let _: () =
+                                                        decode_and_call::<(&mut T, *mut u8), ()>(
+                                                            &hdr,
+                                                            (&mut *prop_ptr, resp_data),
+                                                        );
+
+                                                    // Signal completion
+                                                    // We assume single Launch request per batch for now.
+                                                    // We need to read current req_ready to flip it.
+                                                    // But we don't have easy access to req_flags here (it's in cp).
+                                                    // We can capture `resp_flags` and `req_ready`.
+                                                    // Wait, `req_ready` changes? No, it's fixed for this batch.
+                                                    let new_word =
+                                                        header::pack_ready_count(req_ready, 1);
+                                                    (*resp_flags).store(
+                                                        new_word,
+                                                        core::sync::atomic::Ordering::Release,
+                                                    );
+                                                })
+                                                .expect("spawn launch fiber");
+                                        }
+
+                                        PropertyPtr::Terminate => {
+                                            return;
+                                        }
+                                    }
+
+                                    header_cursor += core::mem::size_of::<RequestRecordHeader>();
+                                    processed += 1;
+                                }
+                            }
+
+                            if deferred_response {
+                            } else {
+                                let new_word =
+                                    header::pack_ready_count(req_ready, processed as u32);
+                                (*resp_flags)
+                                    .store(new_word, core::sync::atomic::Ordering::Release);
+                            }
+
+                            progressed = true;
+                            start_idx = (idx + 1) % n;
+                        }
+
+                        if progressed {
+                            idle_rounds = 0;
+                        } else {
+                            crate::util::fiber::yield_now(); // Yield to fibers!
                         }
                     }
-
-                    let new_word = header::pack_ready_count(req_ready, processed as u32);
-                    unsafe { (*resp_flags).store(new_word, core::sync::atomic::Ordering::Release) };
-                    progressed = true;
-                    start_idx = (idx + 1) % n;
-                }
-
-                if progressed {
-                    idle_rounds = 0;
-                } else {
-                    WaitBudget::default().step();
-                }
-            }
-        });
+                })
+        }
+        .expect("failed to spawn trustee fiber");
 
         let rt = Runtime {
             reg: reg.clone(),
@@ -272,6 +377,7 @@ impl<T: Send + 'static> Runtime<T> {
         let chan = Arc::new(ChannelPair::default());
         reg.push(ClientPair {
             chan: chan.clone(),
+            pending_launch: false,
             _phantom: PhantomData,
         });
 
@@ -280,7 +386,7 @@ impl<T: Send + 'static> Runtime<T> {
             chan,
             registrar,
             _phantom: PhantomData,
-            _owner: Some(rt.clone()),
+            _owner: Some(Arc::new(rt.clone())),
             _not_sync: core::marker::PhantomData,
         };
 
@@ -292,6 +398,7 @@ impl<T: Send + 'static> Runtime<T> {
         let chan = Arc::new(ChannelPair::default());
         self.reg.push(ClientPair {
             chan: chan.clone(),
+            pending_launch: false,
             _phantom: PhantomData,
         });
 
@@ -317,6 +424,7 @@ impl<T> Drop for Runtime<T> {
             let chan = Arc::new(ChannelPair::default());
             self.reg.push(ClientPair {
                 chan: chan.clone(),
+                pending_launch: false,
                 _phantom: PhantomData,
             });
             unsafe {

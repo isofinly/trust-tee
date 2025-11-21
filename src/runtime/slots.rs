@@ -72,12 +72,14 @@ pub mod header {
 
 /// A 128-bit fat pointer to a Rust closure: { data, vtable }.
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct FatClosurePtr {
     pub data: *mut u8,     // where the capture lives inside the slot
     pub vtable: *const (), // erased pointer to ErasedVTable<Args, Ret>
 }
 
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct RequestRecordHeader {
     pub closure: FatClosurePtr,
     pub property_ptr: PropertyPtr,
@@ -94,6 +96,7 @@ pub enum PropertyPtr {
     CallMutOutPtr = 1,
     CallMutArgsOutPtr = 2,
     IntoInner = 3,
+    Launch = 4,
     Terminate = u64::MAX,
 }
 
@@ -210,3 +213,16 @@ impl Default for ChannelPair {
 // trustee writes response). Interior mutability is modeled with UnsafeCell.
 unsafe impl Sync for ChannelPair {}
 unsafe impl Send for ChannelPair {}
+
+unsafe impl Send for FatClosurePtr {}
+unsafe impl Sync for FatClosurePtr {}
+
+unsafe impl Send for RequestRecordHeader {}
+unsafe impl Sync for RequestRecordHeader {}
+
+/// A wrapper for raw pointers that implements Send + Sync.
+/// Useful for passing pointers to fibers/threads where we guarantee safety.
+#[derive(Copy, Clone)]
+pub struct SendPtr<T>(pub *mut T);
+unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T> Sync for SendPtr<T> {}

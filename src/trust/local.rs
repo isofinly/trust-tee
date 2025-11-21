@@ -81,6 +81,46 @@ impl<T> super::common::TrustLike for Local<T> {
     fn into_inner(self) -> T {
         self.inner.into_inner()
     }
+
+    #[inline]
+    /// Launch a fiber to execute `f` on the inner value.
+    fn launch<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&T) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let ptr_atomic = core::sync::atomic::AtomicPtr::new(self.inner.get());
+
+        crate::util::fiber::scope(|s| {
+            #[allow(unused_unsafe)]
+            let handle = unsafe {
+                s.spawn(move || {
+                    let _guard = DelegatedScopeGuard::enter();
+                    let ptr = ptr_atomic.load(core::sync::atomic::Ordering::Relaxed);
+                    // Safety: Launch implies concurrent shared access.
+                    // We cast &mut T (from UnsafeCell) to &T.
+                    f(unsafe { &*ptr })
+                })
+            };
+
+            #[cfg(miri)]
+            return handle.join().unwrap();
+
+            #[cfg(not(miri))]
+            return handle.join();
+        })
+    }
+
+    #[inline]
+    /// Launch `f`, then enqueue `then` to run with the result.
+    fn launch_then<F, R>(&self, f: F, then: impl FnOnce(R))
+    where
+        F: FnOnce(&T) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let r = self.launch(f);
+        then(r)
+    }
 }
 
 impl<T: core::fmt::Display> core::fmt::Display for Local<T> {

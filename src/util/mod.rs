@@ -1,5 +1,7 @@
 pub mod affinity;
 pub mod fiber;
+/// Latch synchronization primitive.
+pub mod latch;
 /// Thread ID utilities.
 pub mod thread_id;
 /// Wait budget utilities for spin-wait loops.

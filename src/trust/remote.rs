@@ -18,13 +18,28 @@ pub struct Remote<T> {
     pub(crate) registrar: Registrar<T>,
     pub(crate) _phantom: PhantomData<T>,
     // When created via Remote::entrust(), keep the runtime alive until this handle drops.
-    pub(crate) _owner: Option<Runtime<T>>,
+    pub(crate) _owner: Option<Arc<Runtime<T>>>,
     // Not Sync marker to enforce SPSC semantics: &Remote<T> is !Sync
     pub(crate) _not_sync: PhantomData<Cell<()>>,
 }
 
 // Enforce SPSC: Remote handles are sendable.
 unsafe impl<T: Send + 'static> Send for Remote<T> {}
+
+impl<T> Clone for Remote<T> {
+    fn clone(&self) -> Self {
+        let chan = Arc::new(ChannelPair::default());
+        self.registrar.register(chan.clone());
+
+        Self {
+            chan,
+            registrar: self.registrar.clone(),
+            _phantom: PhantomData,
+            _owner: self._owner.clone(), // Share ownership of runtime
+            _not_sync: PhantomData,
+        }
+    }
+}
 
 impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
     type Value = T;
@@ -37,7 +52,7 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
             chan: handle.chan.clone(),
             registrar: handle.registrar.clone(),
             _phantom: PhantomData,
-            _owner: Some(rt),
+            _owner: Some(Arc::new(rt)),
             _not_sync: PhantomData,
         }
     }
@@ -63,84 +78,6 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
                 .trustee_prop
                 .load(core::sync::atomic::Ordering::Relaxed) as *mut T;
             if !prop_ptr.is_null() {
-                // Safety: We are on the trustee thread, so we have exclusive access to the property.
-                // The runtime ensures that no other closures are running on this thread while we are here
-                // (because we are the one running!).
-                // We must ensure that we don't violate aliasing rules. Since we are in `apply`,
-                // we are effectively borrowing the trust. If the runtime is also borrowing it,
-                // that would be an issue. However, the runtime loop yields to us (the client code)
-                // only when it's not using the property.
-                // WAIT: The runtime loop is:
-                // 1. Drain registrations
-                // 2. Process requests
-                // 3. Yield/Spin
-                //
-                // If we are running, it means the runtime loop called us? No, `Remote` is a client handle.
-                // If we are on the trustee thread, it means we are running AS the trustee fiber (or another fiber on the same thread).
-                // If we are the trustee fiber, we are inside the loop.
-                // But `apply` is called by CLIENT code.
-                //
-                // Case 1: We are a separate fiber on the same thread.
-                // The runtime loop runs, then yields. When it yields, our fiber runs.
-                // So the runtime is NOT using the property.
-                // So it is safe to access it.
-                //
-                // Case 2: We are called FROM a closure running on the trustee.
-                // i.e. nested delegation.
-                // `apply` blocks. If we block waiting for ourselves, we deadlock.
-                // But here we DON'T block. We execute directly.
-                // Is it safe to create a &mut T here?
-                // The outer closure has &mut T.
-                // If we create another &mut T, we have two mutable references. UB!
-                //
-                // The paper says: "In Trust<T>, blocking in delegated context is prohibited... Closures may still use apply_then(), but not the blocking apply()."
-                // So `apply` inside a delegated closure is ALREADY illegal/discouraged because it blocks.
-                // But with this shortcut, it DOESN'T block.
-                // However, it creates aliasing.
-                //
-                // If we are in a separate fiber (Case 1), the runtime loop is suspended (yielded).
-                // The runtime loop holds `mut prop`.
-                // But it's a local variable in the stack frame of the loop.
-                // When it yields, that borrow is technically still active?
-                // No, `prop` is owned by the loop. It's not borrowed while yielding.
-                // So Case 1 is SAFE.
-                //
-                // How to distinguish Case 1 from Case 2?
-                // In Case 2, we are inside a closure called by the runtime.
-                // The runtime passes `&mut prop` to the closure.
-                // So `prop` IS borrowed.
-                //
-                // We need to know if `prop` is currently borrowed.
-                // We can't easily know that without a flag.
-                //
-                // However, `apply` is documented as blocking. Calling it from a delegated closure is a logic error (deadlock) normally.
-                // With this optimization, it becomes an aliasing error (UB).
-                //
-                // If we assume the user follows the rules (no `apply` inside delegated closure), then Case 2 never happens.
-                // But we should probably be safe.
-                //
-                // For now, let's implement the shortcut assuming Case 1 (Fiber on same thread).
-                // This is the "Local Trustee Shortcut" mentioned in the paper section 5.2.1.
-                // "When a Trust has the current thread as its trustee, it is superfluous to use delegation...
-                // Instead, it is just as safe... to simply apply the closure directly...
-                // As a reminder, we know this because delegated closures may not suspend the current fiber."
-                //
-                // This implies that if we are running, we are NOT a delegated closure (because they can't suspend/block, and `apply` is blocking... wait).
-                // If `apply` is called, it means we are running.
-                // If we were a delegated closure, we would be running.
-                // But delegated closures cannot call `apply` (deadlock).
-                // So if we are running `apply`, we are NOT a delegated closure (or the user is deadlocking).
-                // If we are NOT a delegated closure, but we are on the trustee thread, we MUST be another fiber.
-                // And if we are another fiber, the runtime loop (which owns `prop`) is yielded.
-                // So `prop` is NOT borrowed.
-                // So it IS safe.
-                //
-                // One catch: `prop` is owned by the runtime loop stack.
-                // We are accessing it via a raw pointer `trustee_prop`.
-                // We need to make sure `prop` hasn't moved or been dropped.
-                // `Runtime` keeps the thread alive. `Remote` keeps `Runtime` alive (via `_owner` or just refcount).
-                // `prop` stays on the stack of the worker thread function.
-                // As long as the worker thread is alive, `prop` is valid.
                 unsafe {
                     let p = &mut *(prop_ptr as *mut T);
                     return f(p);
@@ -502,6 +439,81 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
             core::ptr::read_unaligned(resp_data.cast::<T>())
         }
     }
+
+    #[inline]
+    /// Launch a fiber to execute `f` on the inner value.
+    fn launch<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&T) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        unsafe {
+            let base = self.chan.request.get() as *mut u8;
+            let hdr_offset = header::next_boundary_offset(
+                HEADER_BYTES,
+                core::mem::size_of::<RequestRecordHeader>(),
+                core::mem::align_of::<RequestRecordHeader>(),
+            );
+            let payload_offset = hdr_offset + core::mem::size_of::<RequestRecordHeader>();
+
+            let mut w = SlotWriter {
+                base,
+                len: SLOT_BYTES,
+                cursor: payload_offset,
+            };
+            // Encode closure. Note: we use PropertyPtr::Launch.
+            // The runtime expects FnOnce(&mut T, *mut u8).
+            // We adapt f: FnOnce(&T) -> R.
+            let hdr = encode_closure::<_, (&mut T, *mut u8), ()>(
+                &mut w,
+                PropertyPtr::Launch,
+                move |(p, out)| {
+                    // Safety: Launch implies concurrent shared access.
+                    // We cast &mut T to &T.
+                    let shared_p = &*(p as *const T);
+                    let r = f(shared_p);
+                    core::ptr::write_unaligned(out as *mut R, r);
+                },
+                &[],
+            );
+            let hdr_ptr = base.add(hdr_offset) as *mut RequestRecordHeader;
+            core::ptr::write_unaligned(hdr_ptr, hdr);
+
+            // Signal request ready
+            let resp_flags = self.chan.response.get() as *const core::sync::atomic::AtomicU32;
+            let req_flags = self.chan.request.get() as *const core::sync::atomic::AtomicU32;
+            let resp_word = (*resp_flags).load(core::sync::atomic::Ordering::Acquire);
+            let req_ready = !header::ready(resp_word);
+            let word = header::pack_ready_count(req_ready, 1);
+            (*req_flags).store(word, core::sync::atomic::Ordering::Release);
+
+            // Wait for response (signaled by fiber)
+            let mut budget = WaitBudget::hot();
+            loop {
+                let resp_word_now = (*resp_flags).load(core::sync::atomic::Ordering::Acquire);
+                if header::ready(resp_word_now) == req_ready {
+                    break;
+                }
+                budget.step();
+            }
+
+            // Read result
+            let resp_base = self.chan.response.get() as *const u8;
+            let resp_data = resp_base.add(HEADER_BYTES);
+            core::ptr::read_unaligned(resp_data.cast::<R>())
+        }
+    }
+
+    #[inline]
+    /// Launch `f`, then enqueue `then` to run with the result.
+    fn launch_then<F, R>(&self, f: F, then: impl FnOnce(R))
+    where
+        F: FnOnce(&T) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let r = self.launch(f);
+        then(r)
+    }
 }
 
 impl<T: Send + 'static + core::fmt::Display> core::fmt::Display for Remote<T> {
@@ -515,21 +527,5 @@ impl<T: Send + 'static + core::fmt::Debug> core::fmt::Debug for Remote<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let s = self.with(|v| format!("{:?}", v));
         f.debug_tuple("Remote").field(&s).finish()
-    }
-}
-
-impl<T: Send + 'static> Clone for Remote<T> {
-    fn clone(&self) -> Self {
-        // allocate a fresh ChannelPair for this clone and register it with worker
-        let chan = Arc::new(ChannelPair::default());
-
-        self.registrar.register(chan.clone());
-        Self {
-            chan,
-            registrar: self.registrar.clone(),
-            _phantom: PhantomData,
-            _owner: None,
-            _not_sync: PhantomData,
-        }
     }
 }
