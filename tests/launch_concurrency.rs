@@ -43,8 +43,11 @@ fn test_launch_concurrency() {
     // Client B: Apply and signal
     let tx_clone = tx.clone();
     let handle_b = std::thread::spawn(move || {
-        remote_b.apply(move |val| {
-            println!("Client B: Running apply. Value: {}", *val);
+        // Use `with` (shared access) instead of `apply` (exclusive access).
+        // Since Latch has interior mutability (Mutex), `with` is sufficient and safe.
+        // `apply` would create `&mut T` which conflicts with `Launch`'s `&T`, causing UB.
+        remote_b.with(move |val| {
+            println!("Client B: Running apply. Value: {:?}", val);
             // Signal Client A
             tx_clone.lock().unwrap().send(()).unwrap();
             *val.lock() += 1;

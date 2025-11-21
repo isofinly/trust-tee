@@ -100,11 +100,13 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
                 cursor: payload_offset,
             };
             // Encode closure that writes its return value into response slot.
-            let hdr = encode_closure::<_, (&mut T, *mut u8), ()>(
+            // Use *mut T to avoid runtime creating &mut T.
+            let hdr = encode_closure::<_, (*mut T, *mut u8), ()>(
                 &mut w,
                 PropertyPtr::CallMutOutPtr,
                 move |(p, out)| {
-                    let r = f(p);
+                    // Safety: apply requires exclusive access.
+                    let r = f(&mut *p);
                     core::ptr::write_unaligned(out as *mut R, r);
                 },
                 &[],
@@ -190,13 +192,14 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
             };
             // Serialize argument `w` into args buffer; trustee will deserialize.
             let args = bincode::serialize(&w).expect("bincode serialize");
-            let hdr = encode_closure::<_, (&mut T, *mut u8, *const u8, u32), ()>(
+            // Use *mut T
+            let hdr = encode_closure::<_, (*mut T, *mut u8, *const u8, u32), ()>(
                 &mut wtr,
                 PropertyPtr::CallMutArgsOutPtr,
                 move |(p, out, bytes, len)| {
                     let slice = { core::slice::from_raw_parts(bytes, len as usize) };
                     let v: V = bincode::deserialize(slice).expect("bincode deserialize");
-                    let r = f(p, v);
+                    let r = f(&mut *p, v);
                     core::ptr::write_unaligned(out as *mut R, r);
                 },
                 &args,
@@ -266,11 +269,12 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
                 cursor: payload_offset,
             };
             // Invoke f with &T view and write result into response
-            let hdr = encode_closure::<_, (&mut T, *mut u8), ()>(
+            // Use *mut T
+            let hdr = encode_closure::<_, (*mut T, *mut u8), ()>(
                 &mut w,
                 PropertyPtr::CallMutOutPtr,
                 move |(p, out)| {
-                    let r = f(&*p as &T);
+                    let r = f(&*p);
                     core::ptr::write_unaligned(out as *mut R, r);
                 },
                 &[],
@@ -462,15 +466,15 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
                 cursor: payload_offset,
             };
             // Encode closure. Note: we use PropertyPtr::Launch.
-            // The runtime expects FnOnce(&mut T, *mut u8).
+            // The runtime expects FnOnce(*mut T, *mut u8).
             // We adapt f: FnOnce(&T) -> R.
-            let hdr = encode_closure::<_, (&mut T, *mut u8), ()>(
+            let hdr = encode_closure::<_, (*mut T, *mut u8), ()>(
                 &mut w,
                 PropertyPtr::Launch,
                 move |(p, out)| {
                     // Safety: Launch implies concurrent shared access.
-                    // We cast &mut T to &T.
-                    let shared_p = &*(p as *const T);
+                    // We cast *mut T to &T.
+                    let shared_p = &*p;
                     let r = f(shared_p);
                     core::ptr::write_unaligned(out as *mut R, r);
                 },

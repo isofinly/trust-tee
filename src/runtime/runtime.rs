@@ -209,9 +209,9 @@ impl<T: Send + 'static> Runtime<T> {
                                         PropertyPtr::CallMutOutPtr => {
                                             let resp_base = cp.chan.response.get() as *mut u8;
                                             let resp_data = resp_base.add(HEADER_BYTES);
-                                            let _: () = decode_and_call::<(&mut T, *mut u8), ()>(
+                                            let _: () = decode_and_call::<(*mut T, *mut u8), ()>(
                                                 &hdr,
-                                                (&mut *prop.as_ref().get(), resp_data),
+                                                (prop.as_ref().get(), resp_data),
                                             );
                                         }
                                         PropertyPtr::CallMutArgsOutPtr => {
@@ -222,12 +222,12 @@ impl<T: Send + 'static> Runtime<T> {
                                                 base.add(hdr.args_offset as usize) as *const u8;
                                             let args_len = hdr.args_len;
                                             let _: () = decode_and_call::<
-                                                (&mut T, *mut u8, *const u8, u32),
+                                                (*mut T, *mut u8, *const u8, u32),
                                                 (),
                                             >(
                                                 &hdr,
                                                 (
-                                                    &mut *prop.as_ref().get(),
+                                                    prop.as_ref().get(),
                                                     resp_data,
                                                     args_ptr,
                                                     args_len,
@@ -305,17 +305,14 @@ impl<T: Send + 'static> Runtime<T> {
                                                     let hdr = hdr_copy;
 
                                                     // Execute the closure.
-                                                    // Note: We pass `&mut *prop_ptr` but we treat it as shared if T is Latch.
-                                                    // The closure signature for Launch should probably be `FnOnce(&T)`.
-                                                    // But `decode_and_call` is generic.
-                                                    // If we use `CallMutOutPtr` logic (FnOnce(&mut T, *mut u8)), we get `&mut T`.
-                                                    // This is technically aliasing if main loop also uses `&mut T`.
-                                                    // But since we are in UnsafeCell land, we just need to avoid data races.
-                                                    // If T is Latch, it is safe.
+                                                    // Note: We pass `prop_ptr` (*mut T) directly.
+                                                    // The closure signature for Launch expects `*mut T` and casts to `&T`.
+                                                    // This avoids creating `&mut T` in the runtime, which would conflict with
+                                                    // concurrent `Apply` calls (which also create `&mut T`).
                                                     let _: () =
-                                                        decode_and_call::<(&mut T, *mut u8), ()>(
+                                                        decode_and_call::<(*mut T, *mut u8), ()>(
                                                             &hdr,
-                                                            (&mut *prop_ptr, resp_data),
+                                                            (prop_ptr, resp_data),
                                                         );
 
                                                     // Signal completion
