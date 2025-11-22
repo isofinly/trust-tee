@@ -124,6 +124,7 @@ impl<T: Send + 'static> Runtime<T> {
                     );
 
                     let mut clients: SmallVec<[ClientPair<T>; 64]> = SmallVec::new();
+                    let mut fiber_handles: Vec<crate::util::fiber::JoinHandle<()>> = Vec::new();
                     let mut start_idx: usize = 0;
                     let mut idle_rounds: u32 = 0;
 
@@ -378,7 +379,7 @@ impl<T: Send + 'static> Runtime<T> {
                                                         // Send the first job immediately
                                                         let _ = tx.send(job);
 
-                                                        crate::util::fiber::Builder::new()
+                                                        let handle = crate::util::fiber::Builder::new()
                                                             .spawn(move || {
                                                                 // Fiber Loop
                                                                 loop {
@@ -398,6 +399,7 @@ impl<T: Send + 'static> Runtime<T> {
                                                                 }
                                                             })
                                                             .expect("spawn launch fiber");
+                                                        fiber_handles.push(handle);
                                                     }
                                                 }
                                             } else {
@@ -408,7 +410,7 @@ impl<T: Send + 'static> Runtime<T> {
                                                 // Send the first job immediately
                                                 let _ = tx.send(job);
 
-                                                crate::util::fiber::Builder::new()
+                                                let handle = crate::util::fiber::Builder::new()
                                                     .spawn(move || {
                                                         // Fiber Loop
                                                         loop {
@@ -428,10 +430,17 @@ impl<T: Send + 'static> Runtime<T> {
                                                         }
                                                     })
                                                     .expect("spawn launch fiber");
+                                                fiber_handles.push(handle);
                                             }
                                         }
 
                                         PropertyPtr::Terminate => {
+                                            // Clear the pool to drop all Senders, signaling fibers to exit.
+                                            FIBER_POOL.with(|pool| pool.borrow_mut().clear());
+                                            // Join all spawned fibers.
+                                            for handle in fiber_handles {
+                                                let _ = handle.join();
+                                            }
                                             return;
                                         }
                                     }
