@@ -129,13 +129,18 @@ fn main() {
     // 5. Stress test with rapid concurrent operations
     let mut stress_handles = Vec::new();
 
+    let iter: usize = std::env::var("ITER")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+
     for _ in 0..10 {
         let bank_worker = bank.clone();
         let handle = thread::spawn(move || {
             let mut success_count = 0;
             let mut fail_count = 0;
 
-            for j in 0..50 {
+            for j in 0..iter {
                 // Random transfers between existing users
                 let from = if j % 3 == 0 {
                     alice_id

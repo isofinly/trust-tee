@@ -11,6 +11,11 @@ fn get(c: &mut i64) -> u64 {
 }
 
 fn main() {
+    let iter: usize = std::env::var("ITER")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000);
+
     let trust = Remote::entrust(0i64);
 
     trust.apply(incr);
@@ -21,7 +26,7 @@ fn main() {
     let t1 = thread::spawn({
         let h = h2;
         move || {
-            for _ in 0..10_000 {
+            for _ in 0..iter {
                 h.apply(incr);
             }
         }
@@ -31,7 +36,7 @@ fn main() {
     let t2 = thread::spawn({
         let h = h3;
         move || {
-            for _ in 0..10_000 {
+            for _ in 0..iter {
                 h.apply(incr);
             }
         }
@@ -42,5 +47,5 @@ fn main() {
 
     let v = trust.apply(get);
     println!("final: {v}");
-    assert_eq!(v, 1 + 20_000);
+    assert_eq!(v, 1 + (iter as u64 * 2));
 }

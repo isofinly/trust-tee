@@ -41,6 +41,7 @@
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
             rustToolchain
+            samply
           ];
 
           shellHook = ''
@@ -48,6 +49,7 @@
             echo "Tools:"
             echo "  Rust:    $(rustc --version)"
             echo "  Miri:    $(cargo miri --version)"
+            echo "  Samply:  $(samply --version)"
 
             export RUST_BACKTRACE=1
             export CARGO_HOME="$HOME/.cargo"

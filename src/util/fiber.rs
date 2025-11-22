@@ -6,7 +6,8 @@
 
 #[cfg(not(miri))]
 pub use may::coroutine::{Builder, scope, yield_now, JoinHandle, sleep};
-
+#[cfg(not(miri))]
+pub use may::sync::mpsc::{channel, Sender, Receiver};
 
 
 /// Guard for delegated scopes.
@@ -36,6 +37,7 @@ pub mod miri_impl {
     use std::io;
 
     pub use std::thread::{yield_now, JoinHandle, Scope};
+    pub use std::sync::mpsc::{channel, Sender, Receiver};
 
     /// Builder for spawning threads (fibers).
     pub struct Builder {

@@ -44,3 +44,7 @@ harness = false
 [[bench]]
 name = "local_shortcut"
 harness = false
+
+[[bench]]
+name = "launch_bench"
+harness = false

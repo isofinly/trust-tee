@@ -1,7 +1,12 @@
 use core::marker::PhantomData;
 use crossbeam_queue::SegQueue;
 use smallvec::SmallVec;
+use std::cell::RefCell;
 use std::sync::Arc;
+
+thread_local! {
+    static FIBER_POOL: RefCell<Vec<crate::util::fiber::Sender<Job>>> = RefCell::new(Vec::new());
+}
 
 use crate::{
     runtime::serialization::decode_and_call,
@@ -37,6 +42,7 @@ impl<T> Registrar<T> {
         self.reg.push(ClientPair {
             chan,
             pending_launch: false,
+            launch_req_ready: false,
             _phantom: PhantomData,
         });
     }
@@ -55,8 +61,11 @@ impl<T> Clone for Registrar<T> {
 struct ClientPair<T> {
     chan: Arc<ChannelPair>,
     pending_launch: bool,
+    launch_req_ready: bool,
     _phantom: PhantomData<T>,
 }
+
+type Job = Box<dyn FnOnce() + Send>;
 
 /// Runtime hosting a property `T` on a worker thread and serving clients.
 pub struct Runtime<T> {
@@ -118,17 +127,24 @@ impl<T: Send + 'static> Runtime<T> {
                     let mut start_idx: usize = 0;
                     let mut idle_rounds: u32 = 0;
 
+                    let mut loop_counter: usize = 0;
+
                     loop {
+                        loop_counter = loop_counter.wrapping_add(1);
+
                         // Drain registrations in bounded chunks.
-                        let mut drained = 0;
-                        while drained < 256 {
-                            {
-                                match reg_consumer.pop() {
-                                    Some(cp) => {
-                                        clients.push(cp);
-                                        drained += 1;
+                        // Throttled Polling: Only check registrations if we are idle OR every 16th round.
+                        if clients.is_empty() || loop_counter % 16 == 0 {
+                            let mut drained = 0;
+                            while drained < 256 {
+                                {
+                                    match reg_consumer.pop() {
+                                        Some(cp) => {
+                                            clients.push(cp);
+                                            drained += 1;
+                                        }
+                                        None => break,
                                     }
-                                    None => break,
                                 }
                             }
                         }
@@ -149,7 +165,11 @@ impl<T: Send + 'static> Runtime<T> {
                         let mut progressed = false;
 
                         for offs in 0..n {
-                            let idx = (start_idx + offs) % n;
+                            // Optimize Round-Robin Indexing: Replace modulo with conditional subtraction.
+                            let mut idx = start_idx + offs;
+                            if idx >= n {
+                                idx -= n;
+                            }
                             let cp = &mut clients[idx];
 
                             let req_flags =
@@ -166,6 +186,11 @@ impl<T: Send + 'static> Runtime<T> {
                                 if req_ready == resp_ready {
                                     // Launch completed (fiber flipped the bit).
                                     cp.pending_launch = false;
+                                } else if req_ready != cp.launch_req_ready {
+                                    // Launch completed (observed via client progress).
+                                    // Client has already flipped req_ready, so previous launch is done.
+                                    cp.pending_launch = false;
+                                    // Fall through to process new request.
                                 } else {
                                     // Launch still in progress. Skip.
                                     continue;
@@ -262,6 +287,7 @@ impl<T: Send + 'static> Runtime<T> {
                                         PropertyPtr::Launch => {
                                             deferred_response = true;
                                             cp.pending_launch = true;
+                                            cp.launch_req_ready = req_ready;
 
                                             // Capture necessary data for the fiber
                                             // We move an Arc<UnsafeCell<T>> to the fiber.
@@ -285,50 +311,124 @@ impl<T: Send + 'static> Runtime<T> {
                                             // RequestRecordHeader is Send now.
                                             let hdr_copy = hdr;
 
-                                            // Spawn pinned fiber
-                                            crate::util::fiber::Builder::new()
-                                                .spawn(move || {
-                                                    // Reconstruct Arc to ensure cleanup.
-                                                    let prop_raw = prop_ptr_carrier.load(
-                                                        core::sync::atomic::Ordering::Relaxed,
-                                                    );
-                                                    // Safety: We created this pointer from Arc::into_raw.
-                                                    let prop_arc = Arc::from_raw(prop_raw);
-                                                    let prop_ptr = prop_arc.get();
+                                            let mut job: Job = Box::new(move || {
+                                                // Reconstruct Arc to ensure cleanup.
+                                                let prop_raw = prop_ptr_carrier.load(
+                                                    core::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                // Safety: We created this pointer from Arc::into_raw.
+                                                let prop_arc = Arc::from_raw(prop_raw);
+                                                let prop_ptr = prop_arc.get();
 
-                                                    let resp_data = resp_data.load(
-                                                        core::sync::atomic::Ordering::Relaxed,
-                                                    );
-                                                    let resp_flags = resp_flags.load(
-                                                        core::sync::atomic::Ordering::Relaxed,
-                                                    );
-                                                    let hdr = hdr_copy;
+                                                let resp_data = resp_data.load(
+                                                    core::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                let resp_flags = resp_flags.load(
+                                                    core::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                let hdr = hdr_copy;
 
-                                                    // Execute the closure.
-                                                    // Note: We pass `prop_ptr` (*mut T) directly.
-                                                    // The closure signature for Launch expects `*mut T` and casts to `&T`.
-                                                    // This avoids creating `&mut T` in the runtime, which would conflict with
-                                                    // concurrent `Apply` calls (which also create `&mut T`).
-                                                    let _: () =
-                                                        decode_and_call::<(*mut T, *mut u8), ()>(
-                                                            &hdr,
-                                                            (prop_ptr, resp_data),
-                                                        );
-
-                                                    // Signal completion
-                                                    // We assume single Launch request per batch for now.
-                                                    // We need to read current req_ready to flip it.
-                                                    // But we don't have easy access to req_flags here (it's in cp).
-                                                    // We can capture `resp_flags` and `req_ready`.
-                                                    // Wait, `req_ready` changes? No, it's fixed for this batch.
-                                                    let new_word =
-                                                        header::pack_ready_count(req_ready, 1);
-                                                    (*resp_flags).store(
-                                                        new_word,
-                                                        core::sync::atomic::Ordering::Release,
+                                                // Execute the closure.
+                                                // Note: We pass `prop_ptr` (*mut T) directly.
+                                                // The closure signature for Launch expects `*mut T` and casts to `&T`.
+                                                // This avoids creating `&mut T` in the runtime, which would conflict with
+                                                // concurrent `Apply` calls (which also create `&mut T`).
+                                                let _: () =
+                                                    decode_and_call::<(*mut T, *mut u8), ()>(
+                                                        &hdr,
+                                                        (prop_ptr, resp_data),
                                                     );
-                                                })
-                                                .expect("spawn launch fiber");
+
+                                                // Signal completion
+                                                // We assume single Launch request per batch for now.
+                                                // We need to read current req_ready to flip it.
+                                                // But we don't have easy access to req_flags here (it's in cp).
+                                                // We can capture `resp_flags` and `req_ready`.
+                                                // Wait, `req_ready` changes? No, it's fixed for this batch.
+                                                let new_word =
+                                                    header::pack_ready_count(req_ready, 1);
+                                                (*resp_flags).store(
+                                                    new_word,
+                                                    core::sync::atomic::Ordering::Release,
+                                                );
+                                            });
+
+                                            // Try to reuse a fiber from the pool
+                                            let mut reused_tx = None;
+                                            FIBER_POOL.with(|pool| {
+                                                if let Some(tx) = pool.borrow_mut().pop() {
+                                                    reused_tx = Some(tx);
+                                                }
+                                            });
+
+                                            if let Some(tx) = reused_tx {
+                                                // Send job to existing fiber
+                                                match tx.send(job) {
+                                                    Ok(_) => {
+                                                        // Success
+                                                    }
+                                                    Err(e) => {
+                                                        // If send failed, the fiber is dead. Spawn new.
+                                                        job = e.0; // Recover the job
+                                                        // Fallthrough to spawn
+                                                        // println!("Spawning new fiber (reuse failed)");
+                                                        // Spawn new pooled fiber
+                                                        let (tx, rx) = crate::util::fiber::channel::<Job>();
+
+                                                        // Send the first job immediately
+                                                        let _ = tx.send(job);
+
+                                                        crate::util::fiber::Builder::new()
+                                                            .spawn(move || {
+                                                                // Fiber Loop
+                                                                loop {
+                                                                    match rx.recv() {
+                                                                        Ok(job) => {
+                                                                            job();
+                                                                            // Job done. Return self to pool.
+                                                                            FIBER_POOL.with(|pool| {
+                                                                                pool.borrow_mut().push(tx.clone());
+                                                                            });
+                                                                        }
+                                                                        Err(_) => {
+                                                                            // Sender dropped (runtime dropped?), exit.
+                                                                            break;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            })
+                                                            .expect("spawn launch fiber");
+                                                    }
+                                                }
+                                            } else {
+                                                // println!("Spawning new fiber");
+                                                // Spawn new pooled fiber
+                                                let (tx, rx) = crate::util::fiber::channel::<Job>();
+
+                                                // Send the first job immediately
+                                                let _ = tx.send(job);
+
+                                                crate::util::fiber::Builder::new()
+                                                    .spawn(move || {
+                                                        // Fiber Loop
+                                                        loop {
+                                                            match rx.recv() {
+                                                                Ok(job) => {
+                                                                    job();
+                                                                    // Job done. Return self to pool.
+                                                                    FIBER_POOL.with(|pool| {
+                                                                        pool.borrow_mut().push(tx.clone());
+                                                                    });
+                                                                }
+                                                                Err(_) => {
+                                                                    // Sender dropped (runtime dropped?), exit.
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                    })
+                                                    .expect("spawn launch fiber");
+                                            }
                                         }
 
                                         PropertyPtr::Terminate => {
@@ -356,7 +456,14 @@ impl<T: Send + 'static> Runtime<T> {
                         if progressed {
                             idle_rounds = 0;
                         } else {
-                            crate::util::fiber::yield_now(); // Yield to fibers!
+                            // Unified Idle Strategy: Spin briefly before yielding even when clients are present.
+                            if idle_rounds < 8 {
+                                core::hint::spin_loop();
+                                idle_rounds += 1;
+                            } else {
+                                crate::util::fiber::yield_now();
+                                idle_rounds = 0;
+                            }
                         }
                     }
                 })
@@ -375,6 +482,7 @@ impl<T: Send + 'static> Runtime<T> {
         reg.push(ClientPair {
             chan: chan.clone(),
             pending_launch: false,
+            launch_req_ready: false,
             _phantom: PhantomData,
         });
 
@@ -396,6 +504,7 @@ impl<T: Send + 'static> Runtime<T> {
         self.reg.push(ClientPair {
             chan: chan.clone(),
             pending_launch: false,
+            launch_req_ready: false,
             _phantom: PhantomData,
         });
 
@@ -422,6 +531,7 @@ impl<T> Drop for Runtime<T> {
             self.reg.push(ClientPair {
                 chan: chan.clone(),
                 pending_launch: false,
+                launch_req_ready: false,
                 _phantom: PhantomData,
             });
             unsafe {
