@@ -1,12 +1,7 @@
 use core::marker::PhantomData;
 use crossbeam_queue::SegQueue;
 use smallvec::SmallVec;
-use std::cell::RefCell;
 use std::sync::Arc;
-
-thread_local! {
-    static FIBER_POOL: RefCell<Vec<crate::util::fiber::Sender<Job>>> = RefCell::new(Vec::new());
-}
 
 use crate::{
     runtime::serialization::decode_and_call,
@@ -22,6 +17,7 @@ pub(crate) struct Registrar<T> {
     reg: Arc<SegQueue<ClientPair<T>>>,
     pub(crate) trustee_id: Arc<core::sync::atomic::AtomicUsize>,
     pub(crate) trustee_prop: Arc<core::sync::atomic::AtomicPtr<()>>,
+    pub(crate) fiber_pool: Arc<SegQueue<crate::util::fiber::Sender<Job>>>,
 }
 
 impl<T> Registrar<T> {
@@ -30,11 +26,13 @@ impl<T> Registrar<T> {
         reg: Arc<SegQueue<ClientPair<T>>>,
         trustee_id: Arc<core::sync::atomic::AtomicUsize>,
         trustee_prop: Arc<core::sync::atomic::AtomicPtr<()>>,
+        fiber_pool: Arc<SegQueue<crate::util::fiber::Sender<Job>>>,
     ) -> Self {
         Self {
             reg,
             trustee_id,
             trustee_prop,
+            fiber_pool,
         }
     }
     #[inline]
@@ -54,6 +52,7 @@ impl<T> Clone for Registrar<T> {
             reg: self.reg.clone(),
             trustee_id: self.trustee_id.clone(),
             trustee_prop: self.trustee_prop.clone(),
+            fiber_pool: self.fiber_pool.clone(),
         }
     }
 }
@@ -65,13 +64,17 @@ struct ClientPair<T> {
     _phantom: PhantomData<T>,
 }
 
-type Job = Box<dyn FnOnce() + Send>;
+pub(crate) enum Job {
+    Execute(Box<dyn FnOnce() + Send>),
+    Shutdown,
+}
 
 /// Runtime hosting a property `T` on a worker thread and serving clients.
 pub struct Runtime<T> {
     reg: Arc<SegQueue<ClientPair<T>>>,
     trustee_id: Arc<core::sync::atomic::AtomicUsize>,
     trustee_prop: Arc<core::sync::atomic::AtomicPtr<()>>,
+    fiber_pool: Arc<SegQueue<crate::util::fiber::Sender<Job>>>,
     _worker: Option<crate::util::fiber::JoinHandle<()>>,
 }
 
@@ -81,6 +84,7 @@ impl<T> Clone for Runtime<T> {
             reg: self.reg.clone(),
             trustee_id: self.trustee_id.clone(),
             trustee_prop: self.trustee_prop.clone(),
+            fiber_pool: self.fiber_pool.clone(),
             _worker: None,
         }
     }
@@ -100,6 +104,9 @@ impl<T: Send + 'static> Runtime<T> {
         let trustee_id = Arc::new(core::sync::atomic::AtomicUsize::new(0));
         let trustee_prop = Arc::new(core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()));
 
+        let fiber_pool: Arc<SegQueue<crate::util::fiber::Sender<Job>>> = Arc::new(SegQueue::new());
+        let fiber_pool_consumer = fiber_pool.clone();
+        let fiber_pool_producer = fiber_pool.clone();
         let worker_trustee_id = trustee_id.clone();
         let worker_trustee_prop = trustee_prop.clone();
 
@@ -312,7 +319,7 @@ impl<T: Send + 'static> Runtime<T> {
                                             // RequestRecordHeader is Send now.
                                             let hdr_copy = hdr;
 
-                                            let mut job: Job = Box::new(move || {
+                                            let mut job = Job::Execute(Box::new(move || {
                                                 // Reconstruct Arc to ensure cleanup.
                                                 let prop_raw = prop_ptr_carrier.load(
                                                     core::sync::atomic::Ordering::Relaxed,
@@ -341,106 +348,94 @@ impl<T: Send + 'static> Runtime<T> {
                                                     );
 
                                                 // Signal completion
-                                                // We assume single Launch request per batch for now.
-                                                // We need to read current req_ready to flip it.
-                                                // But we don't have easy access to req_flags here (it's in cp).
-                                                // We can capture `resp_flags` and `req_ready`.
-                                                // Wait, `req_ready` changes? No, it's fixed for this batch.
                                                 let new_word =
                                                     header::pack_ready_count(req_ready, 1);
                                                 (*resp_flags).store(
                                                     new_word,
                                                     core::sync::atomic::Ordering::Release,
                                                 );
-                                            });
+                                            }));
 
                                             // Try to reuse a fiber from the pool
-                                            let mut reused_tx = None;
-                                            FIBER_POOL.with(|pool| {
-                                                if let Some(tx) = pool.borrow_mut().pop() {
-                                                    reused_tx = Some(tx);
-                                                }
-                                            });
-
-                                            if let Some(tx) = reused_tx {
-                                                // Send job to existing fiber
-                                                match tx.send(job) {
-                                                    Ok(_) => {
-                                                        // Success
+                                            loop {
+                                                if let Some(tx) = fiber_pool_consumer.pop() {
+                                                    // Send job to existing fiber
+                                                    match tx.send(job) {
+                                                        Ok(_) => {
+                                                            break;
+                                                        }
+                                                        Err(e) => {
+                                                            // If send failed, the fiber is dead. Recover job and try next.
+                                                            job = e.0; // Recover the job
+                                                            continue; // Try next fiber in pool or spawn new
+                                                        }
                                                     }
-                                                    Err(e) => {
-                                                        // If send failed, the fiber is dead. Spawn new.
-                                                        job = e.0; // Recover the job
-                                                        // Fallthrough to spawn
-                                                        // println!("Spawning new fiber (reuse failed)");
-                                                        // Spawn new pooled fiber
-                                                        let (tx, rx) = crate::util::fiber::channel::<Job>();
+                                                } else {
+                                                    // Spawn new pooled fiber
+                                                    let pool_producer = fiber_pool_producer.clone();
+                                                    let (tx, rx) = crate::util::fiber::channel::<Job>();
 
-                                                        // Send the first job immediately
-                                                        let _ = tx.send(job);
+                                                    // Send the first job immediately
+                                                    let _ = tx.send(job);
 
-                                                        let handle = crate::util::fiber::Builder::new()
-                                                            .spawn(move || {
-                                                                // Fiber Loop
-                                                                loop {
-                                                                    match rx.recv() {
-                                                                        Ok(job) => {
-                                                                            job();
-                                                                            // Job done. Return self to pool.
-                                                                            FIBER_POOL.with(|pool| {
-                                                                                pool.borrow_mut().push(tx.clone());
-                                                                            });
-                                                                        }
-                                                                        Err(_) => {
-                                                                            // Sender dropped (runtime dropped?), exit.
-                                                                            break;
-                                                                        }
+                                                    let handle = crate::util::fiber::Builder::new()
+                                                        .spawn(move || {
+                                                            // Fiber Loop
+                                                            loop {
+                                                                match rx.recv() {
+                                                                    Ok(Job::Execute(job)) => {
+                                                                        job();
+                                                                        // Job done. Return self to pool.
+                                                                        pool_producer.push(tx.clone());
+                                                                    }
+                                                                    Ok(Job::Shutdown) => {
+                                                                        break;
+                                                                    }
+                                                                    Err(_) => {
+                                                                        // Sender dropped (runtime dropped?), exit.
+                                                                        break;
                                                                     }
                                                                 }
-                                                            })
-                                                            .expect("spawn launch fiber");
-                                                        fiber_handles.push(handle);
-                                                    }
-                                                }
-                                            } else {
-                                                // println!("Spawning new fiber");
-                                                // Spawn new pooled fiber
-                                                let (tx, rx) = crate::util::fiber::channel::<Job>();
-
-                                                // Send the first job immediately
-                                                let _ = tx.send(job);
-
-                                                let handle = crate::util::fiber::Builder::new()
-                                                    .spawn(move || {
-                                                        // Fiber Loop
-                                                        loop {
-                                                            match rx.recv() {
-                                                                Ok(job) => {
-                                                                    job();
-                                                                    // Job done. Return self to pool.
-                                                                    FIBER_POOL.with(|pool| {
-                                                                        pool.borrow_mut().push(tx.clone());
-                                                                    });
-                                                                }
-                                                                Err(_) => {
-                                                                    // Sender dropped (runtime dropped?), exit.
-                                                                    break;
-                                                                }
                                                             }
-                                                        }
-                                                    })
-                                                    .expect("spawn launch fiber");
-                                                fiber_handles.push(handle);
+                                                        })
+                                                        .expect("spawn launch fiber");
+                                                    fiber_handles.push(handle);
+                                                    break;
+                                                }
                                             }
                                         }
 
                                         PropertyPtr::Terminate => {
-                                            // Clear the pool to drop all Senders, signaling fibers to exit.
-                                            FIBER_POOL.with(|pool| pool.borrow_mut().clear());
-                                            // Join all spawned fibers.
+                                            // Terminator thread to drain the pool and signal shutdown.
+                                            let done = Arc::new(core::sync::atomic::AtomicBool::new(false));
+                                            let done_clone = done.clone();
+                                            let pool_consumer = fiber_pool_consumer.clone();
+
+                                            let terminator = crate::util::fiber::Builder::new()
+                                                .name("terminator".to_string())
+                                                .spawn(move || {
+                                                    while !done_clone.load(core::sync::atomic::Ordering::Relaxed) {
+                                                        if let Some(tx) = pool_consumer.pop() {
+                                                            let _ = tx.send(Job::Shutdown);
+                                                        } else {
+                                                            crate::util::fiber::yield_now();
+                                                            crate::util::fiber::sleep(std::time::Duration::from_millis(1));
+                                                        }
+                                                    }
+                                                    // One last sweep
+                                                    while let Some(tx) = pool_consumer.pop() {
+                                                        let _ = tx.send(Job::Shutdown);
+                                                    }
+                                                })
+                                                .expect("spawn terminator");
+
                                             for handle in fiber_handles {
                                                 let _ = handle.join();
                                             }
+
+                                            done.store(true, core::sync::atomic::Ordering::Relaxed);
+                                            let _ = terminator.join();
+
                                             return;
                                         }
                                     }
@@ -483,6 +478,7 @@ impl<T: Send + 'static> Runtime<T> {
             reg: reg.clone(),
             trustee_id: trustee_id.clone(),
             trustee_prop: trustee_prop.clone(),
+            fiber_pool: fiber_pool.clone(),
             _worker: Some(_worker),
         };
 
@@ -495,7 +491,7 @@ impl<T: Send + 'static> Runtime<T> {
             _phantom: PhantomData,
         });
 
-        let registrar = Registrar::new(reg, trustee_id, trustee_prop);
+        let registrar = Registrar::new(reg, trustee_id, trustee_prop, fiber_pool);
         let handle = Remote {
             chan,
             registrar,
@@ -521,6 +517,7 @@ impl<T: Send + 'static> Runtime<T> {
             self.reg.clone(),
             self.trustee_id.clone(),
             self.trustee_prop.clone(),
+            self.fiber_pool.clone(),
         );
         Remote {
             chan,
