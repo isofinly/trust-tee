@@ -3,7 +3,11 @@ name: Valgrind (memcheck + cachegrind)
 on:
   push:
     branches: [main]
+    paths:
+      - '**.rs'
   pull_request:
+    paths:
+      - '**.rs'
   workflow_dispatch:
 
 jobs:

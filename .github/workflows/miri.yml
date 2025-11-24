@@ -3,7 +3,11 @@ name: Miri (UB sanitizer)
 on:
   push:
     branches: [main]
+    paths:
+      - '**.rs'
   pull_request:
+    paths:
+      - '**.rs'
   workflow_dispatch:
 
 jobs:
