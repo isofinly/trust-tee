@@ -233,6 +233,7 @@ impl<T: Send + 'static> Runtime<T> {
                                     match hdr.property_ptr {
                                         PropertyPtr::CallMutRetUnit => {
                                             for _ in 0..hdr.repeat_count {
+                                                let _guard = crate::util::fiber::DelegatedScopeGuard::enter();
                                                 let _: () = decode_and_call::<(&mut T,), ()>(
                                                     &hdr,
                                                     (&mut *prop.as_ref().get(),),
@@ -242,6 +243,7 @@ impl<T: Send + 'static> Runtime<T> {
                                         PropertyPtr::CallMutOutPtr => {
                                             let resp_base = cp.chan.response.get() as *mut u8;
                                             let resp_data = resp_base.add(HEADER_BYTES);
+                                            let _guard = crate::util::fiber::DelegatedScopeGuard::enter();
                                             let _: () = decode_and_call::<(*mut T, *mut u8), ()>(
                                                 &hdr,
                                                 (prop.as_ref().get(), resp_data),
@@ -254,6 +256,7 @@ impl<T: Send + 'static> Runtime<T> {
                                             let args_ptr =
                                                 base.add(hdr.args_offset as usize) as *const u8;
                                             let args_len = hdr.args_len;
+                                            let _guard = crate::util::fiber::DelegatedScopeGuard::enter();
                                             let _: () = decode_and_call::<
                                                 (*mut T, *mut u8, *const u8, u32),
                                                 (),
@@ -341,6 +344,7 @@ impl<T: Send + 'static> Runtime<T> {
                                                 // The closure signature for Launch expects `*mut T` and casts to `&T`.
                                                 // This avoids creating `&mut T` in the runtime, which would conflict with
                                                 // concurrent `Apply` calls (which also create `&mut T`).
+                                                let _guard = crate::util::fiber::DelegatedScopeGuard::enter();
                                                 let _: () =
                                                     decode_and_call::<(*mut T, *mut u8), ()>(
                                                         &hdr,

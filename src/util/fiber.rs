@@ -10,13 +10,33 @@ pub use may::coroutine::{Builder, scope, yield_now, JoinHandle, sleep};
 pub use may::sync::mpsc::{channel, Sender, Receiver};
 
 
+use core::cell::Cell;
+
+thread_local! {
+    static IN_DELEGATED_CONTEXT: Cell<bool> = Cell::new(false);
+}
+
+/// Returns true if the current thread is executing within a delegated context.
+pub fn is_in_delegated_context() -> bool {
+    IN_DELEGATED_CONTEXT.with(|c| c.get())
+}
+
 /// Guard for delegated scopes.
-pub struct DelegatedScopeGuard;
+pub struct DelegatedScopeGuard {
+    _private: (),
+}
 
 impl DelegatedScopeGuard {
     /// Enter the delegated scope.
     pub fn enter() -> Self {
-        Self
+        IN_DELEGATED_CONTEXT.with(|c| c.set(true));
+        Self { _private: () }
+    }
+}
+
+impl Drop for DelegatedScopeGuard {
+    fn drop(&mut self) {
+        IN_DELEGATED_CONTEXT.with(|c| c.set(false));
     }
 }
 

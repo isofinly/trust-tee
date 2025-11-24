@@ -64,6 +64,10 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
         F: FnOnce(&mut T) -> R + Send + 'static,
         R: Send + 'static,
     {
+        if crate::util::fiber::is_in_delegated_context() {
+            panic!("Blocking delegation is prohibited in delegated context. Use `apply_then` or `launch` instead.");
+        }
+
         // Optimization: Check if we are running on the trustee thread.
         // If so, we can bypass the channel and execute directly.
         let trustee_id = self
@@ -158,6 +162,9 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
         V: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
         R: Send + 'static,
     {
+        if crate::util::fiber::is_in_delegated_context() {
+            panic!("Blocking delegation is prohibited in delegated context. Use `apply_then` or `launch` instead.");
+        }
         // Optimization: Check if we are running on the trustee thread.
         let trustee_id = self
             .registrar
@@ -307,6 +314,9 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
     #[inline]
     /// Apply a mutation `n` times on the inner value and wait for completion.
     fn apply_batch_mut(&self, f: fn(&mut T), n: u8) {
+        if crate::util::fiber::is_in_delegated_context() {
+            panic!("Blocking delegation is prohibited in delegated context. Use `apply_then` or `launch` instead.");
+        }
         if n == 0 {
             return;
         }
@@ -394,6 +404,9 @@ impl<T: Send + 'static> super::common::TrustLike for Remote<T> {
     #[inline]
     /// Get underlying value and drop the trust instance.
     fn into_inner(self) -> T {
+        if crate::util::fiber::is_in_delegated_context() {
+            panic!("Blocking delegation is prohibited in delegated context. Use `apply_then` or `launch` instead.");
+        }
         // Only valid when this remote owns the runtime worker
         assert!(
             self._owner.is_some(),
