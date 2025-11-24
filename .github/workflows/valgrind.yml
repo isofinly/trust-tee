@@ -1,0 +1,85 @@
+name: Valgrind (memcheck + cachegrind)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.rs'
+  pull_request:
+    paths:
+      - '**.rs'
+  workflow_dispatch:
+
+jobs:
+  valgrind:
+    name: Run benchmarks under Valgrind
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    env:
+      BENCH_NAMES: "perf_local perf_pinned_remote perf_latch"
+      ITER: "10"
+      RUST_BACKTRACE: 0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install valgrind
+        run: |
+          sudo apt update
+          sudo apt install valgrind
+
+      - name: Build benches (profiling)
+        shell: bash
+        run: |
+          cargo bench --no-run --all-features --profile profiling
+
+      - name: Run cachegrind and annotate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p cachegrind-raw cachegrind-annotated
+          for name in $BENCH_NAMES; do
+            path=$(ls target/profiling/deps/${name}-* 2>/dev/null | head -n1 || true)
+            if [[ -z "$path" ]]; then
+              echo "Could not find built bench binary for $name under target/profiling/deps" >&2
+              exit 1
+            fi
+            if [[ ! -x "$path" ]]; then
+              echo "Resolved path is not executable for $name: $path" >&2
+              exit 1
+            fi
+            bin=$(basename "$path")
+            raw_out="cachegrind-raw/cachegrind-${bin}.out"
+            ann_out="cachegrind-annotated/cachegrind-${bin}.annotated.txt"
+            log="cachegrind-raw/cachegrind-${bin}.log"
+            echo "==> cachegrind+cg_annotate: $bin"
+            ITER=${ITER} CG_ITER=${ITER} valgrind \
+              --tool=cachegrind \
+              --trace-children=yes \
+              --child-silent-after-fork=yes \
+              --log-file="$log" \
+              --cachegrind-out-file="$raw_out" \
+              "$path" >/dev/null 2>&1 || true
+            if command -v cg_annotate >/dev/null 2>&1; then
+              cg_annotate "$raw_out" > "$ann_out" || true
+            else
+              echo "cg_annotate missing" > "$ann_out"
+            fi
+          done
+
+      - name: Upload cachegrind annotated outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: cachegrind-annotated
+          path: cachegrind-annotated/
+
+      - name: Upload cachegrind valgrind logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: valgrind-cachegrind-logs
+          path: cachegrind-raw/

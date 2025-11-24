@@ -2,11 +2,34 @@
 
 use core::cell::{Cell, UnsafeCell};
 use core::ops::{Deref, DerefMut};
+use std::fmt::{Debug, Display};
 
 /// A lightweight, single-threaded mutual exclusion for `T`.
 pub struct Latch<T> {
     locked: Cell<bool>,
     inner: UnsafeCell<T>,
+}
+
+impl<T> Debug for Latch<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Latch {{ locked: {}, inner: {:?} }}",
+            self.locked.get(),
+            self.inner.get()
+        )
+    }
+}
+
+impl<T> Display for Latch<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Latch {{ locked: {}, inner: {:?} }}",
+            self.locked.get(),
+            self.inner.get()
+        )
+    }
 }
 
 unsafe impl<T: Send> Send for Latch<T> {}
@@ -30,7 +53,7 @@ impl<T> Latch<T> {
         self.locked.set(true);
         Some(LatchGuard {
             latch: self,
-            _marker: std::marker::PhantomData,
+            _marker: core::marker::PhantomData,
         })
     }
 
@@ -62,7 +85,7 @@ impl<T> Latch<T> {
 /// Guard returned by `Latch` methods; unlocks on drop.
 pub struct LatchGuard<'a, T> {
     latch: &'a Latch<T>,
-    _marker: std::marker::PhantomData<*const ()>,
+    _marker: core::marker::PhantomData<*const ()>,
 }
 
 impl<'a, T> Deref for LatchGuard<'a, T> {

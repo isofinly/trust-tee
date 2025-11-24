@@ -6,7 +6,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use trust_tee::{LocalTrustee, PinConfig, RemoteRuntime, pin_current_thread};
+
+use trust_tee::prelude::*;
 
 fn spawn_atomic_hammer(
     ctr: Arc<AtomicU64>,
@@ -51,12 +52,13 @@ fn incr_i64(c: &mut i64) {
 }
 
 fn bench_contention(c: &mut Criterion) {
-    let workers = num_cpus::get().saturating_sub(1).max(1);
+    // let workers = num_cpus::get().saturating_sub(1).max(1);
+    let workers = 3;
     let batch_sizes: &[u32] = &[1, 4, 16, 64];
 
     let mut group = c.benchmark_group("high_contention");
-    group.measurement_time(Duration::from_secs(10));
-    group.warm_up_time(Duration::from_millis(800));
+    group.measurement_time(Duration::from_secs(15));
+    group.warm_up_time(Duration::from_millis(1200));
     group.throughput(Throughput::Elements(1));
 
     // 1) AtomicU64 SeqCst under contention from background workers
@@ -109,8 +111,7 @@ fn bench_contention(c: &mut Criterion) {
 
     // 3) LocalTrustee (single-threaded fast path; !Sync prevents shared contention)
     {
-        let lt = LocalTrustee::new();
-        let t = lt.entrust(0i64);
+        let t = Local::entrust(0i64);
         group.bench_function("local_trustee", |b| {
             b.iter(|| {
                 t.apply(|c| *c += 1);
@@ -118,7 +119,7 @@ fn bench_contention(c: &mut Criterion) {
         });
     }
 
-    // 4) RemoteRuntime with pinning, burst RR fairness, and batched clients.
+    // 4) RemoteRuntime with pinning, single-op apply and batched clients.
     {
         #[cfg(target_os = "linux")]
         let pin_t = PinConfig {
@@ -135,45 +136,51 @@ fn bench_contention(c: &mut Criterion) {
             mac_affinity_tag: Some(1),
         };
 
-        let (rt, handle) = RemoteRuntime::spawn_with_pin(0i64, 1024, 64, Some(pin_t));
+        let trust = Remote::entrust_with_pin(0i64, pin_t);
+
+        // 4a) Plain remote apply (single increment) under contention
+        {
+            let run = Arc::new(AtomicBool::new(true));
+            let threads: Vec<_> = (0..workers)
+                .map(|_| {
+                    let run = Arc::clone(&run);
+                    let trust = trust.clone();
+                    thread::spawn(move || {
+                        while run.load(Ordering::Relaxed) {
+                            trust.apply(incr_i64);
+                            // Let trustee run; avoids perfectly hot spin loops.
+                            std::thread::yield_now();
+                        }
+                    })
+                })
+                .collect();
+
+            group.throughput(Throughput::Elements(1));
+            group.bench_function(
+                BenchmarkId::new("remote_trustee_apply", format!("w{}", workers)),
+                |b| {
+                    b.iter(|| {
+                        trust.apply(incr_i64);
+                    });
+                },
+            );
+
+            run.store(false, Ordering::Relaxed);
+            for t in threads {
+                let _ = t.join();
+            }
+        }
 
         for &batch in batch_sizes {
             let run = Arc::new(AtomicBool::new(true));
 
             let threads: Vec<_> = (0..workers)
-                .map(|i| {
+                .map(|_| {
                     let run = Arc::clone(&run);
-                    let h = rt.handle();
-                    #[cfg(target_os = "linux")]
-                    let client_pin: Option<PinConfig> = if i == 0 {
-                        Some(PinConfig {
-                            core_id: Some(1),
-                            numa_node: None,
-                            mem_bind: false,
-                            mac_affinity_tag: None,
-                        })
-                    } else {
-                        None
-                    };
-                    #[cfg(target_os = "macos")]
-                    let client_pin: Option<PinConfig> = if i == 0 {
-                        Some(PinConfig {
-                            core_id: None,
-                            numa_node: None,
-                            mem_bind: false,
-                            mac_affinity_tag: Some(2),
-                        })
-                    } else {
-                        None
-                    };
-
+                    let trust = trust.clone();
                     thread::spawn(move || {
-                        if let Some(cfg) = client_pin {
-                            // Best-effort pin to keep topology predictable.
-                            pin_current_thread(&cfg);
-                        }
                         while run.load(Ordering::Relaxed) {
-                            h.apply_batch_mut(incr_i64, batch);
+                            trust.apply_batch_mut(incr_i64, batch as u8);
                             // Yield to let trustee run; avoids perfectly hot spin loops.
                             std::thread::yield_now();
                         }
@@ -186,7 +193,7 @@ fn bench_contention(c: &mut Criterion) {
                 BenchmarkId::new("remote_trustee_batched", format!("w{workers}_b{batch}")),
                 |b| {
                     b.iter(|| {
-                        handle.apply_batch_mut(incr_i64, batch);
+                        trust.apply_batch_mut(incr_i64, batch as u8);
                     });
                 },
             );

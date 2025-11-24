@@ -8,3 +8,6 @@
 #/target
 
 profile.*
+.env
+.envrc
+.direnv

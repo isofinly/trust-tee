@@ -1,13 +1,22 @@
+use std::env;
+
 use trust_tee::prelude::*;
+
+#[inline(never)]
+fn touch(v: u64) {
+    std::hint::black_box(v);
+}
 
 fn incr(c: &mut i64) {
     *c += 1;
 }
-fn get(c: &mut i64) -> u64 {
-    *c as u64
-}
 
 fn main() {
+    let iterations: usize = env::var("ITER")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50_000);
+
     #[cfg(target_os = "linux")]
     let pin = PinConfig {
         core_id: Some(0),
@@ -15,7 +24,6 @@ fn main() {
         mem_bind: true,
         mac_affinity_tag: None,
     };
-
     #[cfg(target_os = "macos")]
     let pin = PinConfig {
         core_id: None,
@@ -26,9 +34,16 @@ fn main() {
 
     let trust = Remote::entrust_with_pin(0i64, pin);
 
-    trust.apply(incr);
+    // Warmup to stabilize cache state
+    for _ in 0..(iterations / 10).max(1) {
+        trust.apply(incr);
+    }
 
-    let v = trust.apply(get);
+    for _ in 0..iterations {
+        trust.apply(incr);
+    }
 
-    println!("final(remote): {v}");
+    let sum = trust.apply(|c| *c as u64);
+    touch(sum);
+    println!("pinned_remote_sum={sum}");
 }
