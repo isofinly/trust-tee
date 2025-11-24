@@ -1,64 +1,90 @@
 # Trust-T
 
-A Rust library providing trust-based concurrency primitives for local and remote execution.
+**High-performance Rust concurrency primitives using trust-based isolation** — achieve atomic-like performance with exclusive access guarantees through dedicated worker threads and zero-copy SPSC channels.
 
 ## Features
 
 - **Local Trust**: Single-threaded execution with zero allocation and no atomics
-- **Remote Trust**: Cross-thread execution via SPSC queues and worker threads
-- **Latch**: Single-threaded mutual exclusion without atomic instructions
-- **Feature-gated**: Remote functionality behind `remote` feature flag
+- **Remote Trust**: Cross-thread execution via lock-free SPSC channels and dedicated worker threads
+- **Fiber Pooling**: Optimized `launch` API with fiber reuse for low latency
+- **Local Shortcut**: Automatic detection and bypass of channel overhead when calling from the worker thread
 
 ## Quick Start
 
 ```rust
 use trust_tee::prelude::*;
 
-// Local trust - single-threaded
-let local = Local::new(42u32);
-let result = local.with_mut(|x| *x + 1);
+// Local trust - single-threaded, zero overhead
+let local = Local::entrust(42u32);
+let result = local.apply(|x| *x + 1);
 
-// With Latch for mutual exclusion
-let latch_trust = Local::new(Latch::new(100u32));
-let result = latch_trust.lock_apply(|x| *x + 10);
+// Remote trust - cross-thread with dedicated worker
+let remote = Remote::entrust(200u32);
+remote.apply(|x| *x += 1);
+let result = remote.with(|x| *x as u64);
 
-#[cfg(feature = "remote")]
-{
-    // Remote trust - cross-thread
-    let (runtime, remote) = Runtime::spawn(200u32, 1024);
-    remote.apply_mut(|x| *x += 1);
-    let result = remote.map_u64(|x| *x as u64);
-}
+// Batch operations for better throughput
+remote.apply_batch_mut(|x| *x += 1, 16);
+
+// Launch concurrent fiber operations
+let value = remote.launch(|x| expensive_computation(x));
 ```
 
 ## Architecture
 
 ### Module Structure
 
-- `trust/` - Local and remote trust implementations
-- `single_thread/` - Single-threaded primitives (Latch, launch APIs)
-- `runtime/` - Remote runtime for cross-thread execution
-- `util/` - Shared utilities (waiting, affinity, fiber management)
+- `trust/` - Core trust trait and implementations (`Local`, `Remote`)
+- `runtime/` - Remote runtime with worker thread, slot-based protocol, and fiber management
+- `single_thread/` - Single-threaded primitives (Latch)
+- `util/` - Utilities (wait budgets, affinity, Miri-compatible fibers)
 
 ### Key Types
 
 - `Local<T>` - Local trust for single-threaded execution
-- `Remote<T>` - Remote trust for cross-thread execution (requires `remote` feature)
+- `Remote<T>` - Remote trust using SPSC channels and worker thread
+- `Runtime<T>` - Worker thread runtime managing property and client requests
 - `Latch<T>` - Single-threaded mutual exclusion without atomics
-- `Runtime<T>` - Remote runtime manager (requires `remote` feature)
 
-### Safety Guarantees
+### Optimizations
 
-- Local path: Uses `UnsafeCell` with fiber scope guards
-- Remote path: Uses function pointers for cross-thread safety
-- Latch: Single-threaded only, panics on re-entrance
-- Launch APIs: Only available for `Local<Latch<T>>` to prevent races
+**Fiber Pooling**: The runtime maintains a shared pool (`Arc<SegQueue>`) of idle fibers for `launch` operations. When a fiber completes its task, it returns to the pool rather than exiting, enabling ~344ns `launch` latency.
+
+**Local Shortcut**: When `apply`/`with`/`launch` is called from the worker thread itself (recursive apply), the runtime detects this via thread ID and directly accesses the property via pointer, bypassing the channel entirely.
+
+**Adaptive Waiting**: Clients use `WaitBudget` with bounded spinning (128 iterations) followed by yielding (8 times) before continuous spinning, balancing latency and CPU usage.
 
 ## Cargo Features
 
-- `local` (default) - Local trust functionality
-- `remote` - Remote trust and runtime functionality
+- `default` - Local and remote trust functionality
+
+## Testing
+
+```bash
+cargo test
+
+MIRIFLAGS="-Zmiri-many-seeds -Zdeduplicate-diagnostics -Zmiri-strict-provenance" cargo miri test
+
+cargo bench --bench contention
+```
 
 ## Examples
 
-See `examples/basic_usage.rs` for a complete example.
+- `examples/remote_simple.rs` - Basic remote trust usage
+- `examples/remote_complex.rs` - Complex multi-client scenarios
+- `examples/recursive_apply.rs` - Local shortcut demonstration
+- `examples/launch_test.rs` - Fiber pooling and concurrent operations
+
+## References
+
+This implementation is based (as closely as possible) on the paper:
+
+> "Delegation with Trust<T>: A Scalable, Type- and Memory-Safe Alternative to Locks"
+
+The design prioritizes the no-atomics approach described in the paper, using SPSC channels and trustee-side execution to achieve high performance without atomic instructions.
+
+Arxiv: [Delegation with Trust<T>: A Scalable, Type- and Memory-Safe Alternative to Locks](https://arxiv.org/abs/2408.11173)
+
+## License
+
+This project is licensed under the MIT License. See the LICENSE file for details.
