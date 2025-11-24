@@ -46,14 +46,6 @@ let value = remote.launch(|x| expensive_computation(x));
 - `Runtime<T>` - Worker thread runtime managing property and client requests
 - `Latch<T>` - Single-threaded mutual exclusion without atomics
 
-### Optimizations
-
-**Fiber Pooling**: The runtime maintains a shared pool (`Arc<SegQueue>`) of idle fibers for `launch` operations. When a fiber completes its task, it returns to the pool rather than exiting, enabling ~344ns `launch` latency.
-
-**Local Shortcut**: When `apply`/`with`/`launch` is called from the worker thread itself (recursive apply), the runtime detects this via thread ID and directly accesses the property via pointer, bypassing the channel entirely.
-
-**Adaptive Waiting**: Clients use `WaitBudget` with bounded spinning (128 iterations) followed by yielding (8 times) before continuous spinning, balancing latency and CPU usage.
-
 ## Cargo Features
 
 - `default` - Local and remote trust functionality
