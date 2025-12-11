@@ -14,6 +14,8 @@ jobs:
   bench:
     name: Run Criterion on Ubuntu (x86_64)
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
     env:
       CARGO_TERM_COLOR: always
     steps:

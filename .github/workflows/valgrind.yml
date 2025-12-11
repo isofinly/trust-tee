@@ -1,4 +1,4 @@
-name: Valgrind (memcheck + cachegrind)
+name: Valgrind
 
 on:
   push:
