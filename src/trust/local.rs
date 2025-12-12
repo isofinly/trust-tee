@@ -1,5 +1,5 @@
 use crate::trust::common::TrustLike;
-use crate::util::fiber::DelegatedScopeGuard;
+
 use core::cell::UnsafeCell;
 
 /// A trust over a property `T` executed by its local trustee.
@@ -26,7 +26,6 @@ impl<T> super::common::TrustLike for Local<T> {
         F: FnOnce(&mut T) -> R + Send + 'static,
         R: Send + 'static,
     {
-        let _guard = DelegatedScopeGuard::enter();
         unsafe { f(&mut *self.inner.get()) }
     }
 
@@ -48,7 +47,6 @@ impl<T> super::common::TrustLike for Local<T> {
         V: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
         R: Send + 'static,
     {
-        let _guard = DelegatedScopeGuard::enter();
         unsafe { f(&mut *self.inner.get(), w) }
     }
 
@@ -59,14 +57,12 @@ impl<T> super::common::TrustLike for Local<T> {
         F: FnOnce(&T) -> R + Send + 'static,
         R: Send + 'static,
     {
-        let _guard = DelegatedScopeGuard::enter();
         unsafe { f(&*self.inner.get()) }
     }
 
     #[inline]
     /// Apply a mutation `n` times on the inner value and wait for completion.
     fn apply_batch_mut(&self, f: fn(&mut T), n: u8) {
-        let _guard = DelegatedScopeGuard::enter();
         unsafe {
             let ptr = self.inner.get();
             // TODO: Actually batch
@@ -95,7 +91,6 @@ impl<T> super::common::TrustLike for Local<T> {
             #[allow(unused_unsafe)]
             let handle = unsafe {
                 s.spawn(move || {
-                    let _guard = DelegatedScopeGuard::enter();
                     let ptr = ptr_atomic.load(core::sync::atomic::Ordering::Relaxed);
                     // Safety: Launch implies concurrent shared access.
                     // We cast &mut T (from UnsafeCell) to &T.

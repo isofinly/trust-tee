@@ -114,6 +114,7 @@ impl<T: Send + 'static> Runtime<T> {
             crate::util::fiber::Builder::new()
                 .name("trustee".to_string())
                 .spawn(move || {
+                    let _guard = crate::util::fiber::TrusteeThreadGuard::enter();
                     // Note: PinConfig is ignored here as may manages threads.
 
                     // Wrap prop in Arc<UnsafeCell> to allow shared ownership between worker and fibers.
@@ -233,7 +234,6 @@ impl<T: Send + 'static> Runtime<T> {
                                     match hdr.property_ptr {
                                         PropertyPtr::CallMutRetUnit => {
                                             for _ in 0..hdr.repeat_count {
-                                                let _guard = crate::util::fiber::DelegatedScopeGuard::enter();
                                                 let _: () = decode_and_call::<(&mut T,), ()>(
                                                     &hdr,
                                                     (&mut *prop.as_ref().get(),),
@@ -243,7 +243,6 @@ impl<T: Send + 'static> Runtime<T> {
                                         PropertyPtr::CallMutOutPtr => {
                                             let resp_base = cp.chan.response.get() as *mut u8;
                                             let resp_data = resp_base.add(HEADER_BYTES);
-                                            let _guard = crate::util::fiber::DelegatedScopeGuard::enter();
                                             let _: () = decode_and_call::<(*mut T, *mut u8), ()>(
                                                 &hdr,
                                                 (prop.as_ref().get(), resp_data),
@@ -256,7 +255,6 @@ impl<T: Send + 'static> Runtime<T> {
                                             let args_ptr =
                                                 base.add(hdr.args_offset as usize) as *const u8;
                                             let args_len = hdr.args_len;
-                                            let _guard = crate::util::fiber::DelegatedScopeGuard::enter();
                                             let _: () = decode_and_call::<
                                                 (*mut T, *mut u8, *const u8, u32),
                                                 (),
@@ -339,25 +337,42 @@ impl<T: Send + 'static> Runtime<T> {
                                                 );
                                                 let hdr = hdr_copy;
 
+                                                // Use a guard to ensure we signal completion even if the closure panics.
+                                                struct CompletionGuard {
+                                                    resp_flags: *mut core::sync::atomic::AtomicU32,
+                                                    req_ready: bool,
+                                                }
+                                                impl Drop for CompletionGuard {
+                                                    fn drop(&mut self) {
+                                                        unsafe {
+                                                            let new_word = crate::runtime::slots::header::pack_ready_count(
+                                                                self.req_ready,
+                                                                1,
+                                                            );
+                                                            (*self.resp_flags).store(
+                                                                new_word,
+                                                                core::sync::atomic::Ordering::Release,
+                                                            );
+                                                        }
+                                                    }
+                                                }
+
+                                                let _completion_guard = CompletionGuard {
+                                                    resp_flags,
+                                                    req_ready,
+                                                };
+
                                                 // Execute the closure.
                                                 // Note: We pass `prop_ptr` (*mut T) directly.
                                                 // The closure signature for Launch expects `*mut T` and casts to `&T`.
                                                 // This avoids creating `&mut T` in the runtime, which would conflict with
                                                 // concurrent `Apply` calls (which also create `&mut T`).
-                                                let _guard = crate::util::fiber::DelegatedScopeGuard::enter();
                                                 let _: () =
                                                     decode_and_call::<(*mut T, *mut u8), ()>(
                                                         &hdr,
                                                         (prop_ptr, resp_data),
                                                     );
-
-                                                // Signal completion
-                                                let new_word =
-                                                    header::pack_ready_count(req_ready, 1);
-                                                (*resp_flags).store(
-                                                    new_word,
-                                                    core::sync::atomic::Ordering::Release,
-                                                );
+                                                // _completion_guard drops here, signaling completion.
                                             }));
 
                                             // Try to reuse a fiber from the pool

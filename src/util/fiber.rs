@@ -13,30 +13,30 @@ pub use may::sync::mpsc::{channel, Sender, Receiver};
 use core::cell::Cell;
 
 thread_local! {
-    static IN_DELEGATED_CONTEXT: Cell<bool> = Cell::new(false);
+    static IS_TRUSTEE_THREAD: Cell<bool> = Cell::new(false);
 }
 
-/// Returns true if the current thread is executing within a delegated context.
-pub fn is_in_delegated_context() -> bool {
-    IN_DELEGATED_CONTEXT.with(|c| c.get())
+/// Returns true if the current thread is a trustee thread (running the runtime loop).
+pub fn is_trustee_thread() -> bool {
+    IS_TRUSTEE_THREAD.with(|c| c.get())
 }
 
-/// Guard for delegated scopes.
-pub struct DelegatedScopeGuard {
+/// Guard to mark the current thread as a trustee thread.
+pub struct TrusteeThreadGuard {
     _private: (),
 }
 
-impl DelegatedScopeGuard {
-    /// Enter the delegated scope.
+impl TrusteeThreadGuard {
+    /// Mark the current thread as a trustee thread.
     pub fn enter() -> Self {
-        IN_DELEGATED_CONTEXT.with(|c| c.set(true));
+        IS_TRUSTEE_THREAD.with(|c| c.set(true));
         Self { _private: () }
     }
 }
 
-impl Drop for DelegatedScopeGuard {
+impl Drop for TrusteeThreadGuard {
     fn drop(&mut self) {
-        IN_DELEGATED_CONTEXT.with(|c| c.set(false));
+        IS_TRUSTEE_THREAD.with(|c| c.set(false));
     }
 }
 
